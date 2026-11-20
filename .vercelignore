@@ -1,0 +1,6 @@
+# Configure secrets in Vercel settings instead of uploading local env files
+.env*
+*.env*
+.antigravity/
+.git/
+*.log

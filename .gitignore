@@ -1,0 +1,14 @@
+# No environment files, including .env.example and renamed backups
+.env*
+*.env*
+
+# Private instructions must never enter this repository
+.antigravity/
+
+node_modules/
+dist/
+coverage/
+.vercel/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,34 @@
+{
+  "name": "fixmate-server",
+  "version": "1.0.0",
+  "description": "FixMate backend API server built with Express and MongoDB",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CodeWithTanim/FixMate-Server.git"
+  },
+  "keywords": [
+    "fixmate",
+    "repair-services",
+    "express",
+    "mongodb"
+  ],
+  "author": "CodeWithTanim",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.14.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.21.0"
+  }
+}
