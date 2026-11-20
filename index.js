@@ -230,6 +230,92 @@ app.get('/api/me', verifyToken, (req, res) => {
   });
 });
 
+// GET /api/services - Read approved and available services
+app.get('/api/services', async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const query = {
+      approvalStatus: 'approved',
+      isAvailable: true,
+    };
+
+    const rawLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 20;
+
+    const rawSkip = parseInt(req.query.skip, 10);
+    const skip = Number.isInteger(rawSkip) && rawSkip >= 0 ? rawSkip : 0;
+
+    const [services, total] = await Promise.all([
+      servicesCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      servicesCollection.countDocuments(query),
+    ]);
+
+    const formattedServices = services.map((s) => ({
+      ...s,
+      id: s._id.toString(),
+      _id: s._id.toString(),
+      createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
+    }));
+
+    res.status(200).json({
+      data: formattedServices,
+      total,
+      limit,
+      skip,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/services/:id - Read single approved service
+app.get('/api/services/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'Invalid service ID format',
+      });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(id),
+      approvalStatus: 'approved',
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'Service not found or unavailable',
+      });
+    }
+
+    res.status(200).json({
+      service: {
+        ...service,
+        id: service._id.toString(),
+        _id: service._id.toString(),
+        createdAt:
+          service.createdAt instanceof Date ? service.createdAt.toISOString() : service.createdAt,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // 404 handler
 app.use((req, res, next) => {
   res.status(404).json({
