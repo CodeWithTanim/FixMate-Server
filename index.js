@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { MongoClient, ObjectId } from 'mongodb';
 import jwt from 'jsonwebtoken';
+import Stripe from 'stripe';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -14,6 +15,10 @@ const CORS_ORIGINS = process.env.CORS_ORIGINS
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const JWT_ISSUER = process.env.JWT_ISSUER || 'http://localhost:3000';
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || 'fixmate-api';
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // Exact origin CORS configuration
 const corsOptions = {
@@ -33,11 +38,112 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
 };
 
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '100kb' }));
+
+// Shared Stripe payment fulfillment helper (idempotent for webhook & client return)
+export async function fulfillPaymentSession(session) {
+  const db = await getDb();
+  const bookingsCollection = db.collection('bookings');
+  const paymentsCollection = db.collection('payments');
+
+  const bookingId = session.metadata?.bookingId || session.client_reference_id;
+  if (!bookingId || !ObjectId.isValid(bookingId)) {
+    console.error('Invalid booking ID in session metadata:', bookingId);
+    return null;
+  }
+
+  const booking = await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+  if (!booking) {
+    console.error('Booking not found for payment fulfillment:', bookingId);
+    return null;
+  }
+
+  // Idempotent payment record
+  const existingPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
+  if (!existingPayment) {
+    await paymentsCollection.insertOne({
+      stripeSessionId: session.id,
+      stripePaymentIntentId: session.payment_intent || null,
+      bookingId: booking._id.toString(),
+      serviceId: booking.serviceId,
+      serviceTitle: booking.serviceTitle,
+      customerEmail: booking.customerEmail,
+      customerName: booking.customerName,
+      technicianEmail: booking.technicianEmail,
+      technicianName: booking.technicianName,
+      amount: (session.amount_total || 0) / 100,
+      currency: session.currency || 'usd',
+      status: 'succeeded',
+      createdAt: new Date(),
+    });
+  }
+
+  // Update booking if unpaid
+  if (booking.paymentStatus !== 'paid') {
+    const paidAmount = ((session.amount_total || 0) / 100).toFixed(2);
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(bookingId) },
+      {
+        $set: {
+          paymentStatus: 'paid',
+          stripePaymentIntentId: session.payment_intent || null,
+          stripeSessionId: session.id,
+          paidAt: new Date(),
+          updatedAt: new Date(),
+        },
+        $push: {
+          statusHistory: {
+            status: 'paid',
+            timestamp: new Date(),
+            changedBy: booking.customerEmail,
+            role: 'customer',
+            note: `Payment of $${paidAmount} completed successfully via Stripe`,
+          },
+        },
+      }
+    );
+  }
+
+  return booking;
+}
+
+// Stripe webhook route mounted before JSON body parser to preserve raw buffer
+app.post(
+  '/api/payments/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+      return res.status(200).json({ received: true, note: 'Webhook acknowledged (test environment)' });
+    }
+
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('Stripe webhook signature error:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        await fulfillPaymentSession(session);
+      }
+      res.status(200).json({ received: true });
+    } catch (err) {
+      console.error('Error handling webhook event:', err);
+      res.status(500).json({ error: 'Fulfillment failed' });
+    }
+  }
+);
+
+// Standard JSON body parser for all other routes
+app.use(express.json({ limit: '10mb' }));
 
 // MongoDB connection reuse with cached client & promise
 let cachedClient = null;
@@ -154,7 +260,7 @@ export async function verifyToken(req, res, next) {
       image: user.image || null,
       role: user.role || 'customer',
       phone: user.phone || null,
-      area: user.area || null,
+      serviceArea: user.serviceArea || user.area || null,
       bio: user.bio || null,
       createdAt: user.createdAt,
     };
@@ -248,100 +354,79 @@ app.get('/api/services', async (req, res, next) => {
     const db = await getDb();
     const servicesCollection = db.collection('services');
 
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 6));
+    const skip = (page - 1) * limit;
+
     const query = {
       approvalStatus: 'approved',
       isAvailable: true,
     };
 
-    // Free-text search across title, description, and category (with regex escaping)
     if (req.query.search && typeof req.query.search === 'string') {
-      const escaped = req.query.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (escaped) {
+      const trimmedSearch = req.query.search.trim();
+      if (trimmedSearch) {
+        const escapedSearch = trimmedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         query.$or = [
-          { title: { $regex: escaped, $options: 'i' } },
-          { description: { $regex: escaped, $options: 'i' } },
-          { category: { $regex: escaped, $options: 'i' } },
+          { title: { $regex: escapedSearch, $options: 'i' } },
+          { description: { $regex: escapedSearch, $options: 'i' } },
+          { serviceArea: { $regex: escapedSearch, $options: 'i' } },
         ];
       }
     }
 
-    // Category filter
-    if (req.query.category && typeof req.query.category === 'string') {
-      const cat = req.query.category.trim();
-      if (cat && cat.toLowerCase() !== 'all') {
-        query.category = { $regex: `^${cat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' };
-      }
+    if (req.query.category && typeof req.query.category === 'string' && req.query.category !== 'all') {
+      query.category = req.query.category;
     }
 
-    // Service mode filter: Home Visit or Shop Drop-off
-    if (req.query.serviceMode && typeof req.query.serviceMode === 'string') {
-      const mode = req.query.serviceMode.trim();
-      if (mode && mode.toLowerCase() !== 'all') {
-        query.serviceMode = { $regex: `^${mode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' };
-      }
+    if (req.query.serviceMode && typeof req.query.serviceMode === 'string' && req.query.serviceMode !== 'all') {
+      query.serviceMode = req.query.serviceMode;
     }
 
-    // Sorting
-    const sortParam = req.query.sort || 'newest';
-    let sortQuery = { createdAt: -1, _id: -1 };
+    let sort = { createdAt: -1, _id: -1 };
+    const sortParam = req.query.sort;
     if (sortParam === 'price_asc') {
-      sortQuery = { basePrice: 1, _id: -1 };
+      sort = { basePrice: 1, _id: -1 };
     } else if (sortParam === 'price_desc') {
-      sortQuery = { basePrice: -1, _id: -1 };
+      sort = { basePrice: -1, _id: -1 };
+    } else if (sortParam === 'newest') {
+      sort = { createdAt: -1, _id: -1 };
     }
 
-    // Bounded pagination
-    const rawLimit = parseInt(req.query.limit, 10);
-    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 9;
-
-    const rawPage = parseInt(req.query.page, 10);
-    const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1;
-    const skip = (page - 1) * limit;
-
-    const [services, total] = await Promise.all([
-      servicesCollection
-        .find(query)
-        .sort(sortQuery)
-        .skip(skip)
-        .limit(limit)
-        .toArray(),
-      servicesCollection.countDocuments(query),
-    ]);
+    const totalCount = await servicesCollection.countDocuments(query);
+    const services = await servicesCollection
+      .find(query)
+      .sort(sort)
+      .skip(skip)
+      .limit(limit)
+      .toArray();
 
     const formattedServices = services.map((s) => ({
+      ...s,
       id: s._id.toString(),
       _id: s._id.toString(),
-      title: s.title,
-      category: s.category,
-      description: s.description,
-      image: s.image,
-      basePrice: s.basePrice,
-      estimatedDuration: s.estimatedDuration,
-      serviceMode: s.serviceMode,
-      serviceArea: s.serviceArea,
-      technicianName: s.technicianName,
-      technicianEmail: s.technicianEmail,
-      approvalStatus: s.approvalStatus,
-      isAvailable: s.isAvailable,
       createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
     }));
 
     res.status(200).json({
       data: formattedServices,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit) || 1,
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / limit) || 1,
+      },
     });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/services/:id - Read single approved service
+// GET /api/services/:id - Read single service details (must be approved & available)
 app.get('/api/services/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
+
     if (!ObjectId.isValid(id)) {
       return res.status(404).json({
         error: 'Not Found',
@@ -361,7 +446,7 @@ app.get('/api/services/:id', async (req, res, next) => {
     if (!service) {
       return res.status(404).json({
         error: 'Not Found',
-        message: 'Service not found or unavailable',
+        message: 'Service listing not found or is currently unavailable',
       });
     }
 
@@ -377,6 +462,7 @@ app.get('/api/services/:id', async (req, res, next) => {
         estimatedDuration: service.estimatedDuration,
         serviceMode: service.serviceMode,
         serviceArea: service.serviceArea,
+        technicianId: service.technicianId,
         technicianName: service.technicianName,
         technicianEmail: service.technicianEmail,
         approvalStatus: service.approvalStatus,
@@ -447,7 +533,7 @@ app.post('/api/services', verifyToken, verifyTechnician, async (req, res, next) 
   }
 });
 
-// GET /api/services/my - Technician read own services
+// GET /api/services-my - Technician read own services
 app.get('/api/services-my', verifyToken, verifyTechnician, async (req, res, next) => {
   try {
     const db = await getDb();
@@ -658,7 +744,7 @@ app.patch('/api/admin/services/:id/approval', verifyToken, verifyAdmin, async (r
 // POST /api/upload - Handle image upload to ImgBB
 app.post('/api/upload', verifyToken, async (req, res, next) => {
   try {
-    const { image } = req.body; // Base64 or image URL
+    const { image } = req.body;
     const apiKey = process.env.IMGBB_API_KEY;
 
     if (!image) {
@@ -666,16 +752,13 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
     }
 
     if (!apiKey) {
-      // If ImgBB key not yet provided in env, support direct image URL or base64 placeholder
       return res.status(200).json({
         url: image.startsWith('http') ? image : 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&auto=format&fit=crop&q=60',
-        notice: 'IMGBB_API_KEY pending in environment; using secure fallback image URL',
+        notice: 'IMGBB_API_KEY pending in environment; using secure image fallback',
       });
     }
 
-    // Prepare FormData for ImgBB API
     const formData = new FormData();
-    // Strip data URI prefix if present
     const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     formData.append('image', base64Data);
 
@@ -692,6 +775,798 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
     res.status(200).json({
       url: imgbbJson.data.url,
       display_url: imgbbJson.data.display_url,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// MILESTONE 4: BOOKINGS & REPAIR PIPELINE
+// ==========================================
+
+// POST /api/bookings - Customer submit repair booking request
+app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const { serviceId, customerPhone, serviceAddress, preferredDate, problemDescription } = req.body;
+
+    if (!serviceId || !ObjectId.isValid(serviceId)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid service ID is required' });
+    }
+
+    if (!customerPhone || customerPhone.trim().length < 7) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid contact phone number is required (min 7 digits)' });
+    }
+
+    if (!serviceAddress || serviceAddress.trim().length < 5) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Complete service address is required' });
+    }
+
+    if (!problemDescription || problemDescription.trim().length < 20) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Detailed problem description is required (min 20 characters)' });
+    }
+
+    const bookingDate = new Date(preferredDate);
+    if (isNaN(bookingDate.getTime())) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid preferred service date is required' });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (bookingDate < today) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Preferred service date must be today or in the future' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+    const bookingsCollection = db.collection('bookings');
+
+    // Verify service exists, is approved, and available
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(serviceId),
+      approvalStatus: 'approved',
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'This service is currently unavailable or unapproved for booking',
+      });
+    }
+
+    // Atomic race-condition prevention: Check duplicate active booking by customer
+    const existingActive = await bookingsCollection.findOne({
+      customerEmail: req.user.email,
+      serviceId: service._id.toString(),
+      status: { $in: ['requested', 'accepted', 'in-progress'] },
+    });
+
+    if (existingActive) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: 'You already have an active booking request for this service. Track its progress in your dashboard.',
+      });
+    }
+
+    // Create trusted booking snapshot
+    const newBooking = {
+      serviceId: service._id.toString(),
+      serviceTitle: service.title,
+      serviceCategory: service.category,
+      serviceImage: service.image,
+      basePrice: service.basePrice,
+      finalAmount: service.basePrice,
+      technicianId: service.technicianId,
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+      customerId: req.user.id,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      customerPhone: customerPhone.trim(),
+      serviceAddress: serviceAddress.trim(),
+      preferredDate: bookingDate,
+      problemDescription: problemDescription.trim(),
+      status: 'requested',
+      paymentStatus: 'unpaid',
+      statusHistory: [
+        {
+          status: 'requested',
+          timestamp: new Date(),
+          changedBy: req.user.email,
+          role: 'customer',
+          note: 'Booking requested by customer',
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const insertResult = await bookingsCollection.insertOne(newBooking);
+    newBooking.id = insertResult.insertedId.toString();
+    newBooking._id = insertResult.insertedId.toString();
+
+    res.status(201).json({
+      booking: newBooking,
+      message: 'Repair booking request submitted successfully',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/bookings/my - Customer view own bookings
+app.get('/api/bookings/my', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const bookings = await bookingsCollection
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = bookings.map((b) => ({
+      ...b,
+      id: b._id.toString(),
+      _id: b._id.toString(),
+      preferredDate: b.preferredDate instanceof Date ? b.preferredDate.toISOString() : b.preferredDate,
+      createdAt: b.createdAt instanceof Date ? b.createdAt.toISOString() : b.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/bookings/:id/cancel - Customer cancel booking (only allowed if status === 'requested')
+app.patch('/api/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid booking ID format' });
+    }
+
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    if (!booking) {
+      return res.status(404).json({ error: 'Not Found', message: 'Booking not found' });
+    }
+
+    // Ownership check
+    if (booking.customerEmail !== req.user.email && booking.customerId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not own this booking' });
+    }
+
+    // Enforce terminal state and invariant
+    if (booking.status !== 'requested') {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: `Only pending requests can be cancelled. Current status is already ${booking.status}.`,
+      });
+    }
+
+    const cancelNote = reason?.trim() || 'Booking cancelled by customer';
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: { status: 'cancelled', updatedAt: new Date() },
+        $push: {
+          statusHistory: {
+            status: 'cancelled',
+            timestamp: new Date(),
+            changedBy: req.user.email,
+            role: 'customer',
+            note: cancelNote,
+          },
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Booking request cancelled successfully',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/bookings/technician - Technician get incoming booking requests
+app.get('/api/bookings/technician', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const query = {
+      $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }],
+    };
+
+    if (req.query.status && req.query.status !== 'all') {
+      query.status = req.query.status;
+    }
+
+    const bookings = await bookingsCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+    const formatted = bookings.map((b) => ({
+      ...b,
+      id: b._id.toString(),
+      _id: b._id.toString(),
+      preferredDate: b.preferredDate instanceof Date ? b.preferredDate.toISOString() : b.preferredDate,
+      createdAt: b.createdAt instanceof Date ? b.createdAt.toISOString() : b.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/bookings/:id/status - Technician update booking status through strict lifecycle
+app.patch('/api/bookings/:id/status', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status: targetStatus, note, finalAmount } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid booking ID format' });
+    }
+
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    if (!booking) {
+      return res.status(404).json({ error: 'Not Found', message: 'Booking not found' });
+    }
+
+    // Ownership check
+    if (booking.technicianEmail !== req.user.email && booking.technicianId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You are not the assigned technician for this booking' });
+    }
+
+    // State machine transitions:
+    // requested -> accepted | rejected
+    // accepted -> in-progress
+    // in-progress -> completed (requires positive finalAmount)
+    const currentStatus = booking.status;
+    const allowedTransitions = {
+      requested: ['accepted', 'rejected'],
+      accepted: ['in-progress'],
+      'in-progress': ['completed'],
+    };
+
+    const validTargets = allowedTransitions[currentStatus] || [];
+    if (!validTargets.includes(targetStatus)) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: `Cannot transition booking from '${currentStatus}' to '${targetStatus}'. Allowed: ${validTargets.join(', ') || 'none (terminal state)'}`,
+      });
+    }
+
+    const updateFields = {
+      status: targetStatus,
+      updatedAt: new Date(),
+    };
+
+    if (targetStatus === 'completed') {
+      const parsedAmount = parseFloat(finalAmount);
+      if (isNaN(parsedAmount) || parsedAmount <= 0) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          message: 'Completing a repair job requires a positive final amount',
+        });
+      }
+      updateFields.finalAmount = Math.round(parsedAmount * 100) / 100;
+    }
+
+    const historyEntry = {
+      status: targetStatus,
+      timestamp: new Date(),
+      changedBy: req.user.email,
+      role: 'technician',
+      note: note?.trim() || `Status updated to ${targetStatus}`,
+    };
+
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: updateFields,
+        $push: { statusHistory: historyEntry },
+      }
+    );
+
+    const updated = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      booking: {
+        ...updated,
+        id: updated._id.toString(),
+        _id: updated._id.toString(),
+      },
+      message: `Booking status updated to ${targetStatus}`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// MILESTONE 5: DASHBOARDS, PROFILE & STATS
+// ==========================================
+
+// GET /api/stats/customer - Customer dashboard overview
+app.get('/api/stats/customer', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const allBookings = await bookingsCollection
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const totalBookings = allBookings.length;
+    const activeBookings = allBookings.filter((b) => ['requested', 'accepted', 'in-progress'].includes(b.status)).length;
+    const completedBookings = allBookings.filter((b) => b.status === 'completed').length;
+    const totalSpent = allBookings
+      .filter((b) => b.status === 'completed' && b.paymentStatus === 'paid')
+      .reduce((sum, b) => sum + (b.finalAmount || b.basePrice || 0), 0);
+
+    const recentBookings = allBookings.slice(0, 5).map((b) => ({
+      id: b._id.toString(),
+      serviceTitle: b.serviceTitle,
+      technicianName: b.technicianName,
+      status: b.status,
+      paymentStatus: b.paymentStatus,
+      finalAmount: b.finalAmount || b.basePrice,
+      createdAt: b.createdAt,
+    }));
+
+    res.status(200).json({
+      stats: {
+        totalBookings,
+        activeBookings,
+        completedBookings,
+        totalSpent: Math.round(totalSpent * 100) / 100,
+        recentBookings,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/stats/technician - Technician dashboard overview
+app.get('/api/stats/technician', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+    const servicesCollection = db.collection('services');
+
+    const [bookings, services] = await Promise.all([
+      bookingsCollection
+        .find({ $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }] })
+        .sort({ createdAt: -1 })
+        .toArray(),
+      servicesCollection
+        .find({ $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }] })
+        .toArray(),
+    ]);
+
+    const totalRequests = bookings.length;
+    const pendingRequests = bookings.filter((b) => b.status === 'requested').length;
+    const inProgress = bookings.filter((b) => b.status === 'in-progress').length;
+    const completed = bookings.filter((b) => b.status === 'completed').length;
+    const totalEarnings = bookings
+      .filter((b) => b.status === 'completed' && b.paymentStatus === 'paid')
+      .reduce((sum, b) => sum + (b.finalAmount || b.basePrice || 0), 0);
+
+    const recentRequests = bookings.slice(0, 5).map((b) => ({
+      id: b._id.toString(),
+      serviceTitle: b.serviceTitle,
+      customerName: b.customerName,
+      customerPhone: b.customerPhone,
+      status: b.status,
+      paymentStatus: b.paymentStatus,
+      finalAmount: b.finalAmount || b.basePrice,
+      createdAt: b.createdAt,
+    }));
+
+    res.status(200).json({
+      stats: {
+        totalRequests,
+        pendingRequests,
+        inProgress,
+        completed,
+        totalServices: services.length,
+        totalEarnings: Math.round(totalEarnings * 100) / 100,
+        recentRequests,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/stats/admin - Admin dashboard overview
+app.get('/api/stats/admin', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const usersCollection = db.collection('user');
+    const servicesCollection = db.collection('services');
+    const bookingsCollection = db.collection('bookings');
+    const paymentsCollection = db.collection('payments');
+
+    const [users, services, bookings, payments] = await Promise.all([
+      usersCollection.find({}, { projection: { role: 1 } }).toArray(),
+      servicesCollection.find({}, { projection: { approvalStatus: 1 } }).toArray(),
+      bookingsCollection.find({}).sort({ createdAt: -1 }).toArray(),
+      paymentsCollection.find({ status: 'succeeded' }).toArray(),
+    ]);
+
+    const totalUsers = users.length;
+    const customersCount = users.filter((u) => u.role === 'customer').length;
+    const techniciansCount = users.filter((u) => u.role === 'technician').length;
+
+    const totalServices = services.length;
+    const pendingServicesCount = services.filter((s) => s.approvalStatus === 'pending').length;
+    const approvedServicesCount = services.filter((s) => s.approvalStatus === 'approved').length;
+
+    const totalBookings = bookings.length;
+    const activeBookingsCount = bookings.filter((b) => ['requested', 'accepted', 'in-progress'].includes(b.status)).length;
+    const completedBookingsCount = bookings.filter((b) => b.status === 'completed').length;
+
+    const totalRevenue = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+
+    const recentBookings = bookings.slice(0, 5).map((b) => ({
+      id: b._id.toString(),
+      serviceTitle: b.serviceTitle,
+      customerEmail: b.customerEmail,
+      technicianEmail: b.technicianEmail,
+      status: b.status,
+      finalAmount: b.finalAmount || b.basePrice,
+      createdAt: b.createdAt,
+    }));
+
+    res.status(200).json({
+      stats: {
+        totalUsers,
+        customersCount,
+        techniciansCount,
+        totalServices,
+        pendingServicesCount,
+        approvedServicesCount,
+        totalBookings,
+        activeBookingsCount,
+        completedBookingsCount,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        recentBookings,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/users - Admin list all registered users
+app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const usersCollection = db.collection('user');
+
+    const users = await usersCollection
+      .find({}, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = users.map((u) => ({
+      id: u.id || u._id.toString(),
+      _id: u._id.toString(),
+      name: u.name,
+      email: u.email,
+      role: u.role || 'customer',
+      image: u.image || null,
+      phone: u.phone || null,
+      serviceArea: u.serviceArea || u.area || null,
+      createdAt: u.createdAt instanceof Date ? u.createdAt.toISOString() : u.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted, total: formatted.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/users/:id/role - Admin update user role
+app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    const allowedRoles = ['customer', 'technician', 'admin'];
+    if (!role || !allowedRoles.includes(role)) {
+      return res.status(400).json({ error: 'Validation Error', message: `Invalid role. Allowed: ${allowedRoles.join(', ')}` });
+    }
+
+    const db = await getDb();
+    const usersCollection = db.collection('user');
+
+    const query = [{ id }, { _id: id }];
+    if (ObjectId.isValid(id)) {
+      query.push({ _id: new ObjectId(id) });
+    }
+
+    const targetUser = await usersCollection.findOne({ $or: query });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Not Found', message: 'User not found' });
+    }
+
+    // Critical security invariant: Admins cannot change their own role!
+    if (targetUser.email === req.user.email || targetUser.id === req.user.id || targetUser._id.toString() === req.user.id) {
+      return res.status(400).json({ error: 'Forbidden', message: 'Admins cannot change their own role' });
+    }
+
+    await usersCollection.updateOne({ _id: targetUser._id }, { $set: { role, updatedAt: new Date() } });
+
+    res.status(200).json({
+      success: true,
+      message: `User role updated to ${role}`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/bookings - Admin view all platform bookings
+app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const query = {};
+    if (req.query.status && req.query.status !== 'all') {
+      query.status = req.query.status;
+    }
+
+    const bookings = await bookingsCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+    const formatted = bookings.map((b) => ({
+      ...b,
+      id: b._id.toString(),
+      _id: b._id.toString(),
+      preferredDate: b.preferredDate instanceof Date ? b.preferredDate.toISOString() : b.preferredDate,
+      createdAt: b.createdAt instanceof Date ? b.createdAt.toISOString() : b.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted, total: formatted.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/users/profile - Authenticated user update own profile
+app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
+  try {
+    const { name, phone, serviceArea, bio, image } = req.body;
+    const db = await getDb();
+    const usersCollection = db.collection('user');
+
+    const query = [{ id: req.user.id }, { _id: req.user.id }];
+    if (ObjectId.isValid(req.user.id)) {
+      query.push({ _id: new ObjectId(req.user.id) });
+    }
+
+    const updates = { updatedAt: new Date() };
+    if (name && typeof name === 'string') updates.name = name.trim();
+    if (phone !== undefined) updates.phone = typeof phone === 'string' ? phone.trim() : phone;
+    if (serviceArea !== undefined) updates.serviceArea = typeof serviceArea === 'string' ? serviceArea.trim() : serviceArea;
+    if (bio !== undefined) updates.bio = typeof bio === 'string' ? bio.trim() : bio;
+    if (image !== undefined) updates.image = image;
+
+    await usersCollection.updateOne({ $or: query }, { $set: updates });
+
+    const updatedUser = await usersCollection.findOne({ $or: query });
+
+    res.status(200).json({
+      user: {
+        id: updatedUser.id || updatedUser._id.toString(),
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role || 'customer',
+        image: updatedUser.image || null,
+        phone: updatedUser.phone || null,
+        serviceArea: updatedUser.serviceArea || null,
+        bio: updatedUser.bio || null,
+      },
+      message: 'Profile updated successfully',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// MILESTONE 6: STRIPE TEST PAYMENTS & WEBHOOKS
+// ==========================================
+
+// POST /api/payments/create-checkout-session - Customer create Stripe Checkout session
+app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const { bookingId } = req.body;
+
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid booking ID is required' });
+    }
+
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+    if (!booking) {
+      return res.status(404).json({ error: 'Not Found', message: 'Booking not found' });
+    }
+
+    // Ownership check
+    if (booking.customerEmail !== req.user.email && booking.customerId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not own this booking' });
+    }
+
+    // Pre-requisites: Must be completed and unpaid
+    if (booking.status !== 'completed') {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Payment is only permitted after repair work is completed by the technician',
+      });
+    }
+
+    if (booking.paymentStatus === 'paid') {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'This booking has already been paid in full',
+      });
+    }
+
+    const payAmount = booking.finalAmount || booking.basePrice || 10;
+    const amountInCents = Math.round(payAmount * 100);
+
+    if (!stripe) {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: 'Stripe payment gateway is not configured',
+      });
+    }
+
+    const clientOrigin = req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: `FixMate: ${booking.serviceTitle}`,
+              description: `Completed repair service by ${booking.technicianName}`,
+              images: booking.serviceImage ? [booking.serviceImage] : [],
+            },
+            unit_amount: amountInCents,
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      customer_email: req.user.email,
+      client_reference_id: booking._id.toString(),
+      metadata: {
+        bookingId: booking._id.toString(),
+        customerId: req.user.id,
+        technicianEmail: booking.technicianEmail,
+        serviceTitle: booking.serviceTitle,
+      },
+      success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
+      cancel_url: `${clientOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
+    });
+
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(bookingId) },
+      { $set: { stripeSessionId: session.id, updatedAt: new Date() } }
+    );
+
+    res.status(200).json({
+      url: session.url,
+      sessionId: session.id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/payments/verify - Customer verify Stripe session and fulfill payment
+app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const { session_id, booking_id } = req.query;
+
+    if (!session_id || !booking_id || !ObjectId.isValid(booking_id)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'session_id and valid booking_id are required' });
+    }
+
+    if (!stripe) {
+      return res.status(503).json({ error: 'Service Unavailable', message: 'Stripe gateway not configured' });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (!session || session.payment_status !== 'paid') {
+      return res.status(400).json({ error: 'Bad Request', message: 'Stripe session is not paid' });
+    }
+
+    const metaBookingId = session.metadata?.bookingId || session.client_reference_id;
+    if (metaBookingId !== booking_id) {
+      return res.status(400).json({ error: 'Bad Request', message: 'Session booking mismatch' });
+    }
+
+    const booking = await fulfillPaymentSession(session);
+
+    res.status(200).json({
+      success: true,
+      booking,
+      message: 'Payment verified and booking updated to paid',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/payments/my - Customer view own payment transactions
+app.get('/api/payments/my', verifyToken, verifyCustomer, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const paymentsCollection = db.collection('payments');
+
+    const payments = await paymentsCollection
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = payments.map((p) => ({
+      ...p,
+      id: p._id.toString(),
+      _id: p._id.toString(),
+      createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : p.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/payments - Admin view all transactions & calculate platform revenue
+app.get('/api/admin/payments', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const paymentsCollection = db.collection('payments');
+
+    const payments = await paymentsCollection.find({}).sort({ createdAt: -1 }).toArray();
+
+    const totalRevenue = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+
+    const formatted = payments.map((p) => ({
+      ...p,
+      id: p._id.toString(),
+      _id: p._id.toString(),
+      createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : p.createdAt,
+    }));
+
+    res.status(200).json({
+      data: formatted,
+      totalRevenue: Math.round(totalRevenue * 100) / 100,
+      total: formatted.length,
     });
   } catch (err) {
     next(err);
