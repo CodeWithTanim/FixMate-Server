@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
+import jwt from 'jsonwebtoken';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -10,11 +11,13 @@ const MONGODB_DBNAME = process.env.MONGODB_DBNAME || 'fixmate-db';
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
   : ['http://localhost:3000'];
+const JWT_SECRET = process.env.JWT_SECRET || '';
+const JWT_ISSUER = process.env.JWT_ISSUER || 'http://localhost:3000';
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || 'fixmate-api';
 
 // Exact origin CORS configuration
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow non-browser requests or same-origin server fetches without origin header
     if (!origin) {
       return callback(null, true);
     }
@@ -82,6 +85,108 @@ export async function pingDatabase() {
   return true;
 }
 
+// Authentication middleware
+export async function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Missing or malformed Authorization header',
+    });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+
+    const sub = decoded.sub;
+    if (!sub) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid token subject',
+      });
+    }
+
+    const db = await getDb();
+    const usersCollection = db.collection('user');
+
+    const query = [{ id: sub }, { _id: sub }];
+    if (ObjectId.isValid(sub)) {
+      query.push({ _id: new ObjectId(sub) });
+    }
+
+    const user = await usersCollection.findOne({ $or: query });
+
+    if (!user) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'User account not found',
+      });
+    }
+
+    req.user = {
+      id: user.id || user._id?.toString(),
+      name: user.name,
+      email: user.email,
+      image: user.image || null,
+      role: user.role || 'customer',
+      phone: user.phone || null,
+      area: user.area || null,
+      bio: user.bio || null,
+      createdAt: user.createdAt,
+    };
+
+    next();
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Token has expired',
+      });
+    }
+
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid token signature or payload',
+    });
+  }
+}
+
+export function verifyCustomer(req, res, next) {
+  if (req.user?.role !== 'customer') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Customer access required',
+    });
+  }
+  next();
+}
+
+export function verifyTechnician(req, res, next) {
+  if (req.user?.role !== 'technician') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Technician access required',
+    });
+  }
+  next();
+}
+
+export function verifyAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Admin access required',
+    });
+  }
+  next();
+}
+
 // Root route
 app.get('/', (req, res) => {
   res.status(200).json({
@@ -116,6 +221,13 @@ app.get('/health/ready', async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   }
+});
+
+// Authenticated current user profile projection
+app.get('/api/me', verifyToken, (req, res) => {
+  res.status(200).json({
+    user: req.user,
+  });
 });
 
 // 404 handler
