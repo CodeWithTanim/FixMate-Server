@@ -343,19 +343,28 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Readiness check - bounded database ping
+// Readiness check - bounded database ping with latency measurement
 app.get('/health/ready', async (req, res) => {
+  const startTime = Date.now();
   try {
     await pingDatabase();
+    const latencyMs = Date.now() - startTime;
+    const memory = process.memoryUsage();
     res.status(200).json({
       status: 'ready',
       database: 'connected',
+      latencyMs,
+      memory: {
+        heapUsedMb: Math.round((memory.heapUsed / 1024 / 1024) * 100) / 100,
+        rssMb: Math.round((memory.rss / 1024 / 1024) * 100) / 100,
+      },
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
     res.status(503).json({
       status: 'unavailable',
       error: 'Database connection failed',
+      latencyMs: Date.now() - startTime,
       timestamp: new Date().toISOString(),
     });
   }
