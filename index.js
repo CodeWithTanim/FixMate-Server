@@ -1,11 +1,37 @@
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import { MongoClient } from 'mongodb';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DBNAME = process.env.MONGODB_DBNAME || 'fixmate-db';
+const CORS_ORIGINS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : ['http://localhost:3000'];
+
+// Exact origin CORS configuration
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow non-browser requests or same-origin server fetches without origin header
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    if (CORS_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '100kb' }));
 
 // MongoDB connection reuse with cached client & promise
 let cachedClient = null;
@@ -90,6 +116,23 @@ app.get('/health/ready', async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   }
+});
+
+// 404 handler
+app.use((req, res, next) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `Cannot ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Centralized error handler
+app.use((err, req, res, next) => {
+  const statusCode = err.status || err.statusCode || (err.name === 'UnauthorizedError' ? 401 : 500);
+  res.status(statusCode).json({
+    error: err.name || 'Error',
+    message: statusCode === 500 ? 'Internal server error' : err.message,
+  });
 });
 
 if (process.env.NODE_ENV !== 'test') {
