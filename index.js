@@ -26,7 +26,10 @@ const corsOptions = {
       return callback(null, true);
     }
 
-    return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    const corsError = new Error(`Origin ${origin} not allowed by CORS`);
+    corsError.statusCode = 403;
+    corsError.name = 'Forbidden';
+    return callback(corsError);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -96,22 +99,37 @@ export async function verifyToken(req, res, next) {
   }
 
   const token = authHeader.split(' ')[1];
+  let decoded;
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET, {
+    decoded = jwt.verify(token, JWT_SECRET, {
       algorithms: ['HS256'],
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
     });
-
-    const sub = decoded.sub;
-    if (!sub) {
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
       return res.status(401).json({
         error: 'Unauthorized',
-        message: 'Invalid token subject',
+        message: 'Token has expired',
       });
     }
 
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid token signature or payload',
+    });
+  }
+
+  const sub = decoded.sub;
+  if (!sub) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid token subject',
+    });
+  }
+
+  try {
     const db = await getDb();
     const usersCollection = db.collection('user');
 
@@ -142,17 +160,11 @@ export async function verifyToken(req, res, next) {
     };
 
     next();
-  } catch (err) {
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Token has expired',
-      });
-    }
-
-    return res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Invalid token signature or payload',
+  } catch (dbErr) {
+    console.error('Database error in verifyToken:', dbErr.message);
+    return res.status(503).json({
+      error: 'Service Unavailable',
+      message: 'Database temporarily unavailable',
     });
   }
 }
