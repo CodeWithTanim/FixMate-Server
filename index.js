@@ -826,13 +826,22 @@ app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res, next) =>
     if (!customerPhone || customerPhone.trim().length < 7) {
       return res.status(400).json({ error: 'Validation Error', message: 'Valid contact phone number is required (min 7 digits)' });
     }
+    if (customerPhone.trim().length > 30) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Phone number exceeds maximum limit of 30 characters' });
+    }
 
     if (!serviceAddress || serviceAddress.trim().length < 5) {
       return res.status(400).json({ error: 'Validation Error', message: 'Complete service address is required' });
     }
+    if (serviceAddress.trim().length > 300) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Service address exceeds maximum limit of 300 characters' });
+    }
 
     if (!problemDescription || problemDescription.trim().length < 20) {
       return res.status(400).json({ error: 'Validation Error', message: 'Detailed problem description is required (min 20 characters)' });
+    }
+    if (problemDescription.trim().length > 2000) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Problem description exceeds maximum limit of 2000 characters' });
     }
 
     const bookingDate = new Date(preferredDate);
