@@ -1629,9 +1629,23 @@ app.use((err, req, res, next) => {
 });
 
 if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`FixMate server running on port ${PORT}`);
   });
+
+  const handleShutdown = async (signal) => {
+    console.log(`Received ${signal}. Closing server and database connection pool...`);
+    server.close(async () => {
+      if (cachedClient) {
+        await cachedClient.close().catch(() => {});
+        console.log('MongoDB connection closed.');
+      }
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 }
 
 export default app;
