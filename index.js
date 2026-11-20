@@ -149,6 +149,25 @@ app.use(express.json({ limit: '10mb' }));
 let cachedClient = null;
 let cachedDb = null;
 let connectionPromise = null;
+let indexesInitialized = false;
+
+export async function ensureDatabaseIndexes(db) {
+  if (indexesInitialized) return;
+  try {
+    await Promise.all([
+      db.collection('services').createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 }),
+      db.collection('services').createIndex({ technicianEmail: 1, createdAt: -1 }),
+      db.collection('bookings').createIndex({ customerEmail: 1, createdAt: -1 }),
+      db.collection('bookings').createIndex({ technicianEmail: 1, status: 1 }),
+      db.collection('payments').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
+      db.collection('payments').createIndex({ customerEmail: 1, createdAt: -1 }),
+      db.collection('user').createIndex({ email: 1 }, { unique: true, sparse: true }),
+    ]);
+    indexesInitialized = true;
+  } catch (err) {
+    console.warn('Index initialization notice:', err.message);
+  }
+}
 
 export async function connectToDatabase() {
   if (cachedClient && cachedDb) {
@@ -167,9 +186,10 @@ export async function connectToDatabase() {
 
     connectionPromise = client
       .connect()
-      .then((connectedClient) => {
+      .then(async (connectedClient) => {
         cachedClient = connectedClient;
         cachedDb = connectedClient.db(MONGODB_DBNAME);
+        ensureDatabaseIndexes(cachedDb).catch((e) => console.warn('Indexes deferred:', e.message));
         return { client: cachedClient, db: cachedDb };
       })
       .catch((err) => {
