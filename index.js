@@ -49,6 +49,16 @@ export async function fulfillPaymentSession(session) {
   const bookingsCollection = db.collection('bookings');
   const paymentsCollection = db.collection('payments');
 
+  // Verify session completion and currency invariants
+  if (session.payment_status !== 'paid') {
+    console.error('Ignoring payment fulfillment for unpaid session:', session.id);
+    return null;
+  }
+  if (session.currency && session.currency.toLowerCase() !== 'usd') {
+    console.error('Invalid currency in session:', session.currency);
+    return null;
+  }
+
   const bookingId = session.metadata?.bookingId || session.client_reference_id;
   if (!bookingId || !ObjectId.isValid(bookingId)) {
     console.error('Invalid booking ID in session metadata:', bookingId);
@@ -61,7 +71,7 @@ export async function fulfillPaymentSession(session) {
     return null;
   }
 
-  // Idempotent payment record
+  // Idempotent payment ledger record
   const existingPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
   if (!existingPayment) {
     await paymentsCollection.insertOne({
@@ -81,33 +91,31 @@ export async function fulfillPaymentSession(session) {
     });
   }
 
-  // Update booking if unpaid
-  if (booking.paymentStatus !== 'paid') {
-    const paidAmount = ((session.amount_total || 0) / 100).toFixed(2);
-    await bookingsCollection.updateOne(
-      { _id: new ObjectId(bookingId) },
-      {
-        $set: {
-          paymentStatus: 'paid',
-          stripePaymentIntentId: session.payment_intent || null,
-          stripeSessionId: session.id,
-          paidAt: new Date(),
-          updatedAt: new Date(),
+  // Atomic exactly-once update on booking record
+  const paidAmount = ((session.amount_total || 0) / 100).toFixed(2);
+  await bookingsCollection.updateOne(
+    { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
+    {
+      $set: {
+        paymentStatus: 'paid',
+        stripePaymentIntentId: session.payment_intent || null,
+        stripeSessionId: session.id,
+        paidAt: new Date(),
+        updatedAt: new Date(),
+      },
+      $push: {
+        statusHistory: {
+          status: 'paid',
+          timestamp: new Date(),
+          changedBy: booking.customerEmail,
+          role: 'customer',
+          note: `Payment of $${paidAmount} completed successfully via Stripe`,
         },
-        $push: {
-          statusHistory: {
-            status: 'paid',
-            timestamp: new Date(),
-            changedBy: booking.customerEmail,
-            role: 'customer',
-            note: `Payment of $${paidAmount} completed successfully via Stripe`,
-          },
-        },
-      }
-    );
-  }
+      },
+    }
+  );
 
-  return booking;
+  return bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
 }
 
 // Stripe webhook route mounted before JSON body parser to preserve raw buffer
@@ -119,7 +127,10 @@ app.post(
     let event;
 
     if (!stripe || !STRIPE_WEBHOOK_SECRET) {
-      return res.status(200).json({ received: true, note: 'Webhook acknowledged (test environment)' });
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: 'Stripe webhook handler is not configured with STRIPE_WEBHOOK_SECRET',
+      });
     }
 
     try {
@@ -159,6 +170,7 @@ export async function ensureDatabaseIndexes(db) {
       db.collection('services').createIndex({ technicianEmail: 1, createdAt: -1 }),
       db.collection('bookings').createIndex({ customerEmail: 1, createdAt: -1 }),
       db.collection('bookings').createIndex({ technicianEmail: 1, status: 1 }),
+      db.collection('bookings').createIndex({ customerEmail: 1, serviceId: 1, status: 1 }),
       db.collection('payments').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
       db.collection('payments').createIndex({ customerEmail: 1, createdAt: -1 }),
       db.collection('user').createIndex({ email: 1 }, { unique: true, sparse: true }),
@@ -780,15 +792,32 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
       return res.status(400).json({ error: 'Validation Error', message: 'Image data is required' });
     }
 
-    if (!apiKey) {
+    // Direct HTTP(S) URLs are accepted directly
+    if (typeof image === 'string' && (image.startsWith('http://') || image.startsWith('https://'))) {
       return res.status(200).json({
-        url: image.startsWith('http') ? image : 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&auto=format&fit=crop&q=60',
-        notice: 'IMGBB_API_KEY pending in environment; using secure image fallback',
+        url: image,
+        display_url: image,
+      });
+    }
+
+    if (!apiKey) {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: 'Image upload service is currently unavailable; IMGBB_API_KEY is not configured in server environment',
+      });
+    }
+
+    // Validate base64 image data and payload size limit (max 5MB)
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    const estimatedSizeBytes = base64Data.length * 0.75;
+    if (estimatedSizeBytes > 5 * 1024 * 1024) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Image size exceeds maximum limit of 5MB',
       });
     }
 
     const formData = new FormData();
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
     formData.append('image', base64Data);
 
     const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
@@ -990,8 +1019,12 @@ app.patch('/api/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, r
     }
 
     const cancelNote = reason?.trim() || 'Booking cancelled by customer';
-    await bookingsCollection.updateOne(
-      { _id: new ObjectId(id) },
+    const cancelResult = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        status: 'requested',
+        $or: [{ customerEmail: req.user.email }, { customerId: req.user.id }],
+      },
       {
         $set: { status: 'cancelled', updatedAt: new Date() },
         $push: {
@@ -1005,6 +1038,13 @@ app.patch('/api/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, r
         },
       }
     );
+
+    if (cancelResult.matchedCount === 0) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: 'Booking could not be cancelled. Status was modified concurrently or permission denied.',
+      });
+    }
 
     res.status(200).json({
       success: true,
@@ -1111,13 +1151,24 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyTechnician, async (req,
       note: note?.trim() || `Status updated to ${targetStatus}`,
     };
 
-    await bookingsCollection.updateOne(
-      { _id: new ObjectId(id) },
+    const updateResult = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        status: currentStatus,
+        $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }],
+      },
       {
         $set: updateFields,
         $push: { statusHistory: historyEntry },
       }
     );
+
+    if (updateResult.matchedCount === 0) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: `Booking could not be updated to '${targetStatus}'. Status was modified concurrently.`,
+      });
+    }
 
     const updated = await bookingsCollection.findOne({ _id: new ObjectId(id) });
 
@@ -1532,6 +1583,19 @@ app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res, ne
 
     if (!session_id || !booking_id || !ObjectId.isValid(booking_id)) {
       return res.status(400).json({ error: 'Validation Error', message: 'session_id and valid booking_id are required' });
+    }
+
+    const db = await getDb();
+    const bookingsCollection = db.collection('bookings');
+
+    const bookingDoc = await bookingsCollection.findOne({ _id: new ObjectId(booking_id) });
+    if (!bookingDoc) {
+      return res.status(404).json({ error: 'Not Found', message: 'Booking not found' });
+    }
+
+    // Customer payment ownership verification
+    if (bookingDoc.customerEmail !== req.user.email && bookingDoc.customerId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not own this booking' });
     }
 
     if (!stripe) {
