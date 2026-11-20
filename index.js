@@ -242,7 +242,7 @@ app.get('/api/me', verifyToken, (req, res) => {
   });
 });
 
-// GET /api/services - Read approved and available services
+// GET /api/services - Read approved and available services with search, filters, sorting, and pagination
 app.get('/api/services', async (req, res, next) => {
   try {
     const db = await getDb();
@@ -253,16 +253,55 @@ app.get('/api/services', async (req, res, next) => {
       isAvailable: true,
     };
 
-    const rawLimit = parseInt(req.query.limit, 10);
-    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 20;
+    // Free-text search across title, description, and category (with regex escaping)
+    if (req.query.search && typeof req.query.search === 'string') {
+      const escaped = req.query.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (escaped) {
+        query.$or = [
+          { title: { $regex: escaped, $options: 'i' } },
+          { description: { $regex: escaped, $options: 'i' } },
+          { category: { $regex: escaped, $options: 'i' } },
+        ];
+      }
+    }
 
-    const rawSkip = parseInt(req.query.skip, 10);
-    const skip = Number.isInteger(rawSkip) && rawSkip >= 0 ? rawSkip : 0;
+    // Category filter
+    if (req.query.category && typeof req.query.category === 'string') {
+      const cat = req.query.category.trim();
+      if (cat && cat.toLowerCase() !== 'all') {
+        query.category = { $regex: `^${cat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' };
+      }
+    }
+
+    // Service mode filter: Home Visit or Shop Drop-off
+    if (req.query.serviceMode && typeof req.query.serviceMode === 'string') {
+      const mode = req.query.serviceMode.trim();
+      if (mode && mode.toLowerCase() !== 'all') {
+        query.serviceMode = { $regex: `^${mode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' };
+      }
+    }
+
+    // Sorting
+    const sortParam = req.query.sort || 'newest';
+    let sortQuery = { createdAt: -1, _id: -1 };
+    if (sortParam === 'price_asc') {
+      sortQuery = { basePrice: 1, _id: -1 };
+    } else if (sortParam === 'price_desc') {
+      sortQuery = { basePrice: -1, _id: -1 };
+    }
+
+    // Bounded pagination
+    const rawLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 9;
+
+    const rawPage = parseInt(req.query.page, 10);
+    const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1;
+    const skip = (page - 1) * limit;
 
     const [services, total] = await Promise.all([
       servicesCollection
         .find(query)
-        .sort({ createdAt: -1 })
+        .sort(sortQuery)
         .skip(skip)
         .limit(limit)
         .toArray(),
@@ -270,17 +309,29 @@ app.get('/api/services', async (req, res, next) => {
     ]);
 
     const formattedServices = services.map((s) => ({
-      ...s,
       id: s._id.toString(),
       _id: s._id.toString(),
+      title: s.title,
+      category: s.category,
+      description: s.description,
+      image: s.image,
+      basePrice: s.basePrice,
+      estimatedDuration: s.estimatedDuration,
+      serviceMode: s.serviceMode,
+      serviceArea: s.serviceArea,
+      technicianName: s.technicianName,
+      technicianEmail: s.technicianEmail,
+      approvalStatus: s.approvalStatus,
+      isAvailable: s.isAvailable,
       createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
     }));
 
     res.status(200).json({
       data: formattedServices,
       total,
+      page,
       limit,
-      skip,
+      totalPages: Math.ceil(total / limit) || 1,
     });
   } catch (err) {
     next(err);
