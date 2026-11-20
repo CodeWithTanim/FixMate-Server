@@ -367,12 +367,331 @@ app.get('/api/services/:id', async (req, res, next) => {
 
     res.status(200).json({
       service: {
-        ...service,
         id: service._id.toString(),
         _id: service._id.toString(),
+        title: service.title,
+        category: service.category,
+        description: service.description,
+        image: service.image,
+        basePrice: service.basePrice,
+        estimatedDuration: service.estimatedDuration,
+        serviceMode: service.serviceMode,
+        serviceArea: service.serviceArea,
+        technicianName: service.technicianName,
+        technicianEmail: service.technicianEmail,
+        approvalStatus: service.approvalStatus,
+        isAvailable: service.isAvailable,
         createdAt:
           service.createdAt instanceof Date ? service.createdAt.toISOString() : service.createdAt,
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/services - Technician create service (defaults to pending & available)
+app.post('/api/services', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const { title, category, description, image, basePrice, estimatedDuration, serviceMode, serviceArea } = req.body;
+
+    const allowedCategories = ['Smartphone', 'Laptop & PC', 'AC', 'Refrigerator', 'TV', 'Washing Machine', 'Electrical'];
+    if (!category || !allowedCategories.includes(category)) {
+      return res.status(400).json({ error: 'Validation Error', message: `Invalid category. Allowed: ${allowedCategories.join(', ')}` });
+    }
+
+    const allowedModes = ['Home Visit', 'Shop Drop-off'];
+    if (!serviceMode || !allowedModes.includes(serviceMode)) {
+      return res.status(400).json({ error: 'Validation Error', message: `Invalid service mode. Allowed: ${allowedModes.join(', ')}` });
+    }
+
+    const numericPrice = parseFloat(basePrice);
+    if (isNaN(numericPrice) || numericPrice <= 0) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Base price must be a positive number' });
+    }
+
+    if (!title || !description || !estimatedDuration || !serviceArea) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Title, description, estimatedDuration, and serviceArea are required' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const newService = {
+      title: title.trim(),
+      category,
+      description: description.trim(),
+      image: image || 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&auto=format&fit=crop&q=60',
+      basePrice: Math.round(numericPrice * 100) / 100,
+      estimatedDuration: estimatedDuration.trim(),
+      serviceMode,
+      serviceArea: serviceArea.trim(),
+      technicianId: req.user.id,
+      technicianName: req.user.name,
+      technicianEmail: req.user.email,
+      approvalStatus: 'pending',
+      isAvailable: true,
+      createdAt: new Date(),
+    };
+
+    const result = await servicesCollection.insertOne(newService);
+    newService.id = result.insertedId.toString();
+    newService._id = result.insertedId.toString();
+
+    res.status(201).json({
+      service: newService,
+      message: 'Service listing created and submitted for moderation',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/services/my - Technician read own services
+app.get('/api/services-my', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const query = {
+      $or: [{ technicianId: req.user.id }, { technicianEmail: req.user.email }],
+    };
+
+    const services = await servicesCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+    const formatted = services.map((s) => ({
+      ...s,
+      id: s._id.toString(),
+      _id: s._id.toString(),
+      createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/services/:id - Technician edit service (resets approval to pending)
+app.patch('/api/services/:id', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const existing = await servicesCollection.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ error: 'Not Found', message: 'Service not found' });
+    }
+
+    // Ownership check
+    if (existing.technicianId !== req.user.id && existing.technicianEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not have permission to edit this service' });
+    }
+
+    const updates = {};
+    const { title, description, category, image, basePrice, estimatedDuration, serviceMode, serviceArea } = req.body;
+
+    if (title) updates.title = title.trim();
+    if (description) updates.description = description.trim();
+    if (category) updates.category = category;
+    if (image) updates.image = image;
+    if (basePrice !== undefined) updates.basePrice = Math.round(parseFloat(basePrice) * 100) / 100;
+    if (estimatedDuration) updates.estimatedDuration = estimatedDuration.trim();
+    if (serviceMode) updates.serviceMode = serviceMode;
+    if (serviceArea) updates.serviceArea = serviceArea.trim();
+
+    // Critical invariant: Content edits reset approval status to pending
+    updates.approvalStatus = 'pending';
+    updates.updatedAt = new Date();
+
+    await servicesCollection.updateOne({ _id: new ObjectId(id) }, { $set: updates });
+    const updated = await servicesCollection.findOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      service: {
+        ...updated,
+        id: updated._id.toString(),
+        _id: updated._id.toString(),
+      },
+      message: 'Service updated and resubmitted for admin review',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/services/:id/availability - Technician toggle availability (preserves approval)
+app.patch('/api/services/:id/availability', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const existing = await servicesCollection.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ error: 'Not Found', message: 'Service not found' });
+    }
+
+    if (existing.technicianId !== req.user.id && existing.technicianEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not own this service' });
+    }
+
+    const isAvailable = Boolean(req.body.isAvailable);
+    await servicesCollection.updateOne({ _id: new ObjectId(id) }, { $set: { isAvailable, updatedAt: new Date() } });
+
+    res.status(200).json({
+      success: true,
+      isAvailable,
+      message: `Service is now ${isAvailable ? 'available' : 'hidden from public view'}`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/services/:id - Technician delete service
+app.delete('/api/services/:id', verifyToken, verifyTechnician, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const existing = await servicesCollection.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ error: 'Not Found', message: 'Service not found' });
+    }
+
+    if (existing.technicianId !== req.user.id && existing.technicianEmail !== req.user.email) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You do not own this service' });
+    }
+
+    await servicesCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      success: true,
+      message: 'Service listing removed successfully',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/services - Admin list all services for moderation
+app.get('/api/admin/services', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const query = {};
+    if (req.query.status && req.query.status !== 'all') {
+      query.approvalStatus = req.query.status;
+    }
+
+    const services = await servicesCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+    const formatted = services.map((s) => ({
+      ...s,
+      id: s._id.toString(),
+      _id: s._id.toString(),
+      createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
+    }));
+
+    res.status(200).json({ data: formatted, total: formatted.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/services/:id/approval - Admin approve or reject service
+app.patch('/api/admin/services/:id/approval', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { approvalStatus } = req.body;
+
+    if (!['approved', 'rejected', 'pending'].includes(approvalStatus)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'approvalStatus must be approved, rejected, or pending' });
+    }
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
+    }
+
+    const db = await getDb();
+    const servicesCollection = db.collection('services');
+
+    const result = await servicesCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { approvalStatus, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      return res.status(404).json({ error: 'Not Found', message: 'Service not found' });
+    }
+
+    res.status(200).json({
+      service: {
+        ...result,
+        id: result._id.toString(),
+        _id: result._id.toString(),
+      },
+      message: `Service status updated to ${approvalStatus}`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/upload - Handle image upload to ImgBB
+app.post('/api/upload', verifyToken, async (req, res, next) => {
+  try {
+    const { image } = req.body; // Base64 or image URL
+    const apiKey = process.env.IMGBB_API_KEY;
+
+    if (!image) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Image data is required' });
+    }
+
+    if (!apiKey) {
+      // If ImgBB key not yet provided in env, support direct image URL or base64 placeholder
+      return res.status(200).json({
+        url: image.startsWith('http') ? image : 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&auto=format&fit=crop&q=60',
+        notice: 'IMGBB_API_KEY pending in environment; using secure fallback image URL',
+      });
+    }
+
+    // Prepare FormData for ImgBB API
+    const formData = new FormData();
+    // Strip data URI prefix if present
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    formData.append('image', base64Data);
+
+    const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    const imgbbJson = await imgbbRes.json();
+    if (!imgbbRes.ok || !imgbbJson.data) {
+      return res.status(502).json({ error: 'Upload Failed', message: imgbbJson.error?.message || 'ImgBB upload rejected' });
+    }
+
+    res.status(200).json({
+      url: imgbbJson.data.url,
+      display_url: imgbbJson.data.display_url,
     });
   } catch (err) {
     next(err);
