@@ -18,6 +18,11 @@ const JWT_AUDIENCE = process.env.JWT_AUDIENCE || 'fixmate-api';
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+
+// Enforce test-only Stripe environment (reject livemode keys safely)
+if (STRIPE_SECRET_KEY.startsWith('sk_live_')) {
+  throw new Error('Livemode Stripe secret keys are not permitted in this test environment.');
+}
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // Exact origin CORS configuration
@@ -43,25 +48,126 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Strict money validation for USD repair services and payments
+const MIN_USD_AMOUNT = 0.50; // Stripe USD card payment minimum is 50 cents ($0.50)
+const MAX_USD_AMOUNT = 100000.00; // Cap for repair invoices
+
+export function validateMoneyAmount(val, fieldName = 'Amount', min = MIN_USD_AMOUNT, max = MAX_USD_AMOUNT) {
+  let num;
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val)) {
+      return { valid: false, message: `${fieldName} must be a finite number` };
+    }
+    num = val;
+  } else if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+      return { valid: false, message: `${fieldName} must be a valid positive number with at most 2 decimal places` };
+    }
+    num = Number(trimmed);
+  } else {
+    return { valid: false, message: `${fieldName} must be a valid number` };
+  }
+
+  if (num < min) {
+    return { valid: false, message: `${fieldName} must be at least $${min.toFixed(2)} (gateway minimum for USD card settlement)` };
+  }
+  if (num > max) {
+    return { valid: false, message: `${fieldName} cannot exceed $${max.toFixed(2)}` };
+  }
+
+  const cents = Math.round(num * 100);
+  if (Math.abs(num * 100 - cents) > 1e-5) {
+    return { valid: false, message: `${fieldName} cannot have more than 2 decimal places (fractional cents not permitted)` };
+  }
+
+  return { valid: true, amount: cents / 100, cents };
+}
+
+// Calendar date handling in Asia/Dhaka timezone
+const SERVICE_TIMEZONE = 'Asia/Dhaka';
+
+export function getTodayCalendarDate(timeZone = SERVICE_TIMEZONE) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return formatter.format(new Date());
+}
+
+export function parseAndValidateCalendarDate(dateStr, timeZone = SERVICE_TIMEZONE) {
+  if (typeof dateStr !== 'string') {
+    return { valid: false, message: 'Preferred service date must be a string' };
+  }
+  const trimmed = dateStr.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) {
+    return { valid: false, message: 'Preferred service date must be in YYYY-MM-DD calendar format' };
+  }
+
+  const year = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+
+  if (year < 2020 || year > 2100) {
+    return { valid: false, message: 'Invalid calendar year' };
+  }
+  if (month < 1 || month > 12) {
+    return { valid: false, message: 'Invalid calendar month' };
+  }
+  if (day < 1 || day > 31) {
+    return { valid: false, message: 'Invalid calendar day' };
+  }
+
+  // Days in month calculation: passing day 0 of month+1 gives last day of month in UTC
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) {
+    return { valid: false, message: `Invalid calendar date for month ${month}: month only has ${daysInMonth} days` };
+  }
+
+  const todayStr = getTodayCalendarDate(timeZone);
+  if (trimmed < todayStr) {
+    return { valid: false, message: `Preferred service date must be today (${todayStr}) or later in ${timeZone} timezone` };
+  }
+
+  return { valid: true, date: trimmed };
+}
+
 // Shared Stripe payment fulfillment helper (idempotent for webhook & client return)
 export async function fulfillPaymentSession(session) {
-  if (!session) return null;
+  if (!session || typeof session !== 'object') return null;
 
   const db = await getDb();
   const bookingsCollection = db.collection('bookings');
   const paymentsCollection = db.collection('payments');
 
-  // 1. Verify session completion and currency invariants
+  // Enforce test-only invariant: livemode must be false
+  if (session.livemode === true) {
+    console.error('Rejected livemode payment session in test application:', session.id);
+    return null;
+  }
+
+  // 1. Verify complete session invariants
   if (session.payment_status !== 'paid') {
     console.error('Ignoring payment fulfillment for unpaid session:', session.id);
     return null;
   }
-  if (session.currency && session.currency.toLowerCase() !== 'usd') {
-    console.error('Invalid currency in session:', session.currency);
+  if (!session.currency || session.currency.toLowerCase() !== 'usd') {
+    console.error('Invalid or missing currency in session:', session.currency);
     return null;
   }
   if (session.mode && session.mode !== 'payment') {
     console.error('Invalid session mode for repair payment:', session.mode);
+    return null;
+  }
+  if (typeof session.amount_total !== 'number' || !Number.isInteger(session.amount_total) || session.amount_total <= 0) {
+    console.error('Invalid or non-integer amount_total in session:', session.amount_total);
+    return null;
+  }
+  if (!session.id || typeof session.id !== 'string') {
+    console.error('Missing or invalid session ID');
     return null;
   }
 
@@ -104,35 +210,38 @@ export async function fulfillPaymentSession(session) {
     return null;
   }
 
-  // 5. Verify exact expected cents vs received cents
-  const expectedAmount = booking.finalAmount || booking.basePrice;
-  if (typeof expectedAmount !== 'number' || expectedAmount <= 0) {
-    console.error('Invalid expected amount on booking:', expectedAmount);
+  // 5. Verify exact expected cents vs received cents (no arbitrary fallbacks)
+  const expectedAmount = booking.finalAmount !== undefined ? booking.finalAmount : booking.basePrice;
+  const moneyValidation = validateMoneyAmount(expectedAmount, 'Expected amount');
+  if (!moneyValidation.valid) {
+    console.error('Invalid expected amount on booking:', expectedAmount, moneyValidation.message);
     return null;
   }
-  const expectedCents = Math.round(expectedAmount * 100);
-  const paidCents = Math.round(session.amount_total || 0);
+  const expectedCents = moneyValidation.cents;
+  const paidCents = session.amount_total;
   if (paidCents !== expectedCents) {
     console.error(
-      `Payment amount mismatch for booking ${bookingId}. Expected: ${expectedCents} cents ($${expectedAmount}), received: ${paidCents} cents`
+      `Payment amount mismatch for booking ${bookingId}. Expected: ${expectedCents} cents ($${moneyValidation.amount}), received: ${paidCents} cents`
     );
     return null;
   }
 
-  // 6. If booking is already paid, return idempotent success
+  // 6. If booking is already marked paid, verify existing authoritative ledger row
   if (booking.paymentStatus === 'paid') {
-    return booking;
+    const existing = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+    if (existing && existing.status === 'succeeded') {
+      return booking;
+    }
   }
 
-  // Check if payment ledger record already exists (e.g. from prior webhook or interrupted write)
+  // Check if payment ledger record already exists for this booking or session
   const existingBookingPayment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
   if (existingBookingPayment) {
-    // Reconcile booking from existing authoritative payment ledger record
-    if (existingBookingPayment.status === 'succeeded') {
-      const settledAmount = typeof existingBookingPayment.amount === 'number'
-        ? existingBookingPayment.amount
-        : paidCents / 100;
-
+    if (
+      existingBookingPayment.status === 'succeeded' &&
+      existingBookingPayment.currency === 'usd' &&
+      Math.round(existingBookingPayment.amount * 100) === paidCents
+    ) {
       await bookingsCollection.updateOne(
         { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
         {
@@ -149,22 +258,22 @@ export async function fulfillPaymentSession(session) {
               timestamp: existingBookingPayment.createdAt || new Date(),
               changedBy: booking.customerEmail,
               role: 'customer',
-              note: `Payment of $${Number(settledAmount).toFixed(2)} completed successfully via Stripe`,
+              note: `Payment of $${Number(existingBookingPayment.amount).toFixed(2)} completed successfully via Stripe`,
             },
           },
         }
       );
-
       return await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+    } else {
+      console.error('Incompatible existing payment ledger row for booking:', bookingId);
+      return null;
     }
   }
 
-  // 7. Enforce exactly-once payment ledger insertion (unique on bookingId)
-  const paidAmount = (paidCents / 100).toFixed(2);
+  // 7. Insert authoritative payment ledger row
   let authoritativePayment = null;
-
   try {
-    await paymentsCollection.insertOne({
+    const insertDoc = {
       stripeSessionId: session.id,
       stripePaymentIntentId: session.payment_intent || null,
       bookingId: booking._id.toString(),
@@ -178,47 +287,53 @@ export async function fulfillPaymentSession(session) {
       currency: 'usd',
       status: 'succeeded',
       createdAt: new Date(),
-    });
-    authoritativePayment = {
-      stripeSessionId: session.id,
-      stripePaymentIntentId: session.payment_intent || null,
-      amount: paidCents / 100,
-      createdAt: new Date(),
     };
+    await paymentsCollection.insertOne(insertDoc);
+    authoritativePayment = insertDoc;
   } catch (err) {
     if (err.code === 11000 || err.message?.includes('duplicate key')) {
-      // In case of race condition or duplicate key, load authoritative existing payment
-      authoritativePayment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+      // Look up existing row by bookingId
+      const found = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+      if (
+        found &&
+        found.status === 'succeeded' &&
+        found.currency === 'usd' &&
+        Math.round(found.amount * 100) === paidCents
+      ) {
+        authoritativePayment = found;
+      } else {
+        // Foreign session collision or inconsistent row - DO NOT fabricate an in-memory payment!
+        console.error('Payment ledger collision or inconsistent duplicate key for booking:', bookingId, err.message);
+        return null;
+      }
     } else {
       throw err;
     }
   }
 
-  const finalPayment = authoritativePayment || {
-    stripeSessionId: session.id,
-    stripePaymentIntentId: session.payment_intent || null,
-    amount: paidCents / 100,
-    createdAt: new Date(),
-  };
+  if (!authoritativePayment || authoritativePayment.status !== 'succeeded') {
+    console.error('No authoritative succeeded payment ledger row found for booking:', bookingId);
+    return null;
+  }
 
-  // 8. Atomic exactly-once update on booking record (reconciliation safe)
+  // 8. Atomic update on booking record (only when authoritative ledger row is verified)
   await bookingsCollection.updateOne(
     { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
     {
       $set: {
         paymentStatus: 'paid',
-        stripePaymentIntentId: finalPayment.stripePaymentIntentId || null,
-        stripeSessionId: finalPayment.stripeSessionId || null,
-        paidAt: finalPayment.createdAt || new Date(),
+        stripePaymentIntentId: authoritativePayment.stripePaymentIntentId || null,
+        stripeSessionId: authoritativePayment.stripeSessionId || null,
+        paidAt: authoritativePayment.createdAt || new Date(),
         updatedAt: new Date(),
       },
       $push: {
         statusHistory: {
           status: 'paid',
-          timestamp: finalPayment.createdAt || new Date(),
+          timestamp: authoritativePayment.createdAt || new Date(),
           changedBy: booking.customerEmail,
           role: 'customer',
-          note: `Payment of $${Number(finalPayment.amount).toFixed(2)} completed successfully via Stripe`,
+          note: `Payment of $${Number(authoritativePayment.amount).toFixed(2)} completed successfully via Stripe`,
         },
       },
     }
@@ -322,11 +437,16 @@ export async function connectToDatabase() {
     connectionPromise = client
       .connect()
       .then(async (connectedClient) => {
-        const db = connectedClient.db(MONGODB_DBNAME);
-        await ensureDatabaseIndexes(db);
-        cachedClient = connectedClient;
-        cachedDb = db;
-        return { client: cachedClient, db: cachedDb };
+        try {
+          const db = connectedClient.db(MONGODB_DBNAME);
+          await ensureDatabaseIndexes(db);
+          cachedClient = connectedClient;
+          cachedDb = db;
+          return { client: cachedClient, db: cachedDb };
+        } catch (indexErr) {
+          await connectedClient.close().catch(() => {});
+          throw indexErr;
+        }
       })
       .catch((err) => {
         connectionPromise = null;
@@ -534,22 +654,25 @@ app.get('/api/services', async (req, res, next) => {
         const escapedSearch = trimmedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         query.$or = [
           { title: { $regex: escapedSearch, $options: 'i' } },
+          { category: { $regex: escapedSearch, $options: 'i' } },
           { description: { $regex: escapedSearch, $options: 'i' } },
           { serviceArea: { $regex: escapedSearch, $options: 'i' } },
         ];
       }
     }
 
-    if (req.query.category && typeof req.query.category === 'string' && req.query.category !== 'all') {
+    const allowedCategories = ['Smartphone', 'Laptop & PC', 'AC', 'Refrigerator', 'TV', 'Washing Machine', 'Electrical'];
+    if (typeof req.query.category === 'string' && req.query.category !== 'all' && allowedCategories.includes(req.query.category)) {
       query.category = req.query.category;
     }
 
-    if (req.query.serviceMode && typeof req.query.serviceMode === 'string' && req.query.serviceMode !== 'all') {
+    const allowedModes = ['Home Visit', 'Shop Drop-off'];
+    if (typeof req.query.serviceMode === 'string' && req.query.serviceMode !== 'all' && allowedModes.includes(req.query.serviceMode)) {
       query.serviceMode = req.query.serviceMode;
     }
 
     let sort = { createdAt: -1, _id: -1 };
-    const sortParam = req.query.sort;
+    const sortParam = typeof req.query.sort === 'string' ? req.query.sort : null;
     if (sortParam === 'price_asc') {
       sort = { basePrice: 1, _id: -1 };
     } else if (sortParam === 'price_desc') {
@@ -560,26 +683,61 @@ app.get('/api/services', async (req, res, next) => {
 
     const totalCount = await servicesCollection.countDocuments(query);
     const services = await servicesCollection
-      .find(query)
+      .find(query, {
+        projection: {
+          title: 1,
+          category: 1,
+          description: 1,
+          image: 1,
+          basePrice: 1,
+          estimatedDuration: 1,
+          serviceMode: 1,
+          serviceArea: 1,
+          technicianId: 1,
+          technicianName: 1,
+          technicianEmail: 1,
+          approvalStatus: 1,
+          isAvailable: 1,
+          createdAt: 1,
+        },
+      })
       .sort(sort)
       .skip(skip)
       .limit(limit)
       .toArray();
 
     const formattedServices = services.map((s) => ({
-      ...s,
       id: s._id.toString(),
       _id: s._id.toString(),
+      title: s.title,
+      category: s.category,
+      description: s.description,
+      image: s.image,
+      basePrice: s.basePrice,
+      estimatedDuration: s.estimatedDuration,
+      serviceMode: s.serviceMode,
+      serviceArea: s.serviceArea,
+      technicianId: s.technicianId,
+      technicianName: s.technicianName,
+      technicianEmail: s.technicianEmail,
+      approvalStatus: s.approvalStatus,
+      isAvailable: s.isAvailable,
       createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
     }));
 
+    const totalPages = Math.ceil(totalCount / limit) || 1;
+
     res.status(200).json({
       data: formattedServices,
+      total: totalCount,
+      page,
+      limit,
+      totalPages,
       pagination: {
         page,
         limit,
         total: totalCount,
-        totalPages: Math.ceil(totalCount / limit) || 1,
+        totalPages,
       },
     });
   } catch (err) {
@@ -592,7 +750,7 @@ app.get('/api/services/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
+    if (!id || typeof id !== 'string' || !ObjectId.isValid(id)) {
       return res.status(404).json({
         error: 'Not Found',
         message: 'Invalid service ID format',
@@ -601,6 +759,7 @@ app.get('/api/services/:id', async (req, res, next) => {
 
     const db = await getDb();
     const servicesCollection = db.collection('services');
+    const usersCollection = db.collection('user');
 
     const service = await servicesCollection.findOne({
       _id: new ObjectId(id),
@@ -613,6 +772,32 @@ app.get('/api/services/:id', async (req, res, next) => {
         error: 'Not Found',
         message: 'Service listing not found or is currently unavailable',
       });
+    }
+
+    // Lookup public technician summary
+    let technicianProfile = null;
+    const techUserQuery = [];
+    if (service.technicianId) {
+      techUserQuery.push({ id: service.technicianId }, { _id: service.technicianId });
+      if (ObjectId.isValid(service.technicianId)) {
+        techUserQuery.push({ _id: new ObjectId(service.technicianId) });
+      }
+    }
+    if (service.technicianEmail) {
+      techUserQuery.push({ email: service.technicianEmail });
+    }
+
+    if (techUserQuery.length > 0) {
+      const techUser = await usersCollection.findOne({ $or: techUserQuery });
+      if (techUser) {
+        technicianProfile = {
+          id: techUser.id || techUser._id.toString(),
+          name: techUser.name || service.technicianName,
+          image: techUser.image || null,
+          area: techUser.area || techUser.serviceArea || service.serviceArea || 'Dhaka',
+          bio: techUser.bio || 'Verified professional repair technician specializing in home and workshop repairs.',
+        };
+      }
     }
 
     res.status(200).json({
@@ -628,8 +813,9 @@ app.get('/api/services/:id', async (req, res, next) => {
         serviceMode: service.serviceMode,
         serviceArea: service.serviceArea,
         technicianId: service.technicianId,
-        technicianName: service.technicianName,
+        technicianName: technicianProfile?.name || service.technicianName,
         technicianEmail: service.technicianEmail,
+        technician: technicianProfile,
         approvalStatus: service.approvalStatus,
         isAvailable: service.isAvailable,
         createdAt:
@@ -646,23 +832,39 @@ app.post('/api/services', verifyToken, verifyTechnician, async (req, res, next) 
   try {
     const { title, category, description, image, basePrice, estimatedDuration, serviceMode, serviceArea } = req.body;
 
+    if (typeof title !== 'string' || title.trim().length < 5 || title.trim().length > 120) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Title must be between 5 and 120 characters' });
+    }
+
+    if (typeof description !== 'string' || description.trim().length < 20 || description.trim().length > 2000) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Description must be between 20 and 2000 characters' });
+    }
+
     const allowedCategories = ['Smartphone', 'Laptop & PC', 'AC', 'Refrigerator', 'TV', 'Washing Machine', 'Electrical'];
-    if (!category || !allowedCategories.includes(category)) {
+    if (typeof category !== 'string' || !allowedCategories.includes(category)) {
       return res.status(400).json({ error: 'Validation Error', message: `Invalid category. Allowed: ${allowedCategories.join(', ')}` });
     }
 
     const allowedModes = ['Home Visit', 'Shop Drop-off'];
-    if (!serviceMode || !allowedModes.includes(serviceMode)) {
+    if (typeof serviceMode !== 'string' || !allowedModes.includes(serviceMode)) {
       return res.status(400).json({ error: 'Validation Error', message: `Invalid service mode. Allowed: ${allowedModes.join(', ')}` });
     }
 
-    const numericPrice = parseFloat(basePrice);
-    if (isNaN(numericPrice) || numericPrice <= 0) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Base price must be a positive number' });
+    if (typeof serviceArea !== 'string' || serviceArea.trim().length < 2 || serviceArea.trim().length > 100) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Service area must be between 2 and 100 characters' });
     }
 
-    if (!title || !description || !estimatedDuration || !serviceArea) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Title, description, estimatedDuration, and serviceArea are required' });
+    if (typeof estimatedDuration !== 'string' || estimatedDuration.trim().length < 2 || estimatedDuration.trim().length > 50) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Estimated duration must be between 2 and 50 characters' });
+    }
+
+    if (typeof image !== 'string' || !/^https?:\/\/.+/.test(image.trim())) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid service image URL from uploaded file is required' });
+    }
+
+    const priceValidation = validateMoneyAmount(basePrice, 'Base price');
+    if (!priceValidation.valid) {
+      return res.status(400).json({ error: 'Validation Error', message: priceValidation.message });
     }
 
     const db = await getDb();
@@ -672,8 +874,8 @@ app.post('/api/services', verifyToken, verifyTechnician, async (req, res, next) 
       title: title.trim(),
       category,
       description: description.trim(),
-      image: image || 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&auto=format&fit=crop&q=60',
-      basePrice: Math.round(numericPrice * 100) / 100,
+      image: image.trim(),
+      basePrice: priceValidation.amount,
       estimatedDuration: estimatedDuration.trim(),
       serviceMode,
       serviceArea: serviceArea.trim(),
@@ -727,7 +929,7 @@ app.get('/api/services-my', verifyToken, verifyTechnician, async (req, res, next
 app.patch('/api/services/:id', verifyToken, verifyTechnician, async (req, res, next) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!id || typeof id !== 'string' || !ObjectId.isValid(id)) {
       return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
     }
 
@@ -747,14 +949,69 @@ app.patch('/api/services/:id', verifyToken, verifyTechnician, async (req, res, n
     const updates = {};
     const { title, description, category, image, basePrice, estimatedDuration, serviceMode, serviceArea } = req.body;
 
-    if (title) updates.title = title.trim();
-    if (description) updates.description = description.trim();
-    if (category) updates.category = category;
-    if (image) updates.image = image;
-    if (basePrice !== undefined) updates.basePrice = Math.round(parseFloat(basePrice) * 100) / 100;
-    if (estimatedDuration) updates.estimatedDuration = estimatedDuration.trim();
-    if (serviceMode) updates.serviceMode = serviceMode;
-    if (serviceArea) updates.serviceArea = serviceArea.trim();
+    const allowedCategories = ['Smartphone', 'Laptop & PC', 'AC', 'Refrigerator', 'TV', 'Washing Machine', 'Electrical'];
+    const allowedModes = ['Home Visit', 'Shop Drop-off'];
+
+    if (title !== undefined) {
+      if (typeof title !== 'string' || title.trim().length < 5 || title.trim().length > 120) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Title must be between 5 and 120 characters' });
+      }
+      updates.title = title.trim();
+    }
+
+    if (description !== undefined) {
+      if (typeof description !== 'string' || description.trim().length < 20 || description.trim().length > 2000) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Description must be between 20 and 2000 characters' });
+      }
+      updates.description = description.trim();
+    }
+
+    if (category !== undefined) {
+      if (typeof category !== 'string' || !allowedCategories.includes(category)) {
+        return res.status(400).json({ error: 'Validation Error', message: `Invalid category. Allowed: ${allowedCategories.join(', ')}` });
+      }
+      updates.category = category;
+    }
+
+    if (serviceMode !== undefined) {
+      if (typeof serviceMode !== 'string' || !allowedModes.includes(serviceMode)) {
+        return res.status(400).json({ error: 'Validation Error', message: `Invalid service mode. Allowed: ${allowedModes.join(', ')}` });
+      }
+      updates.serviceMode = serviceMode;
+    }
+
+    if (serviceArea !== undefined) {
+      if (typeof serviceArea !== 'string' || serviceArea.trim().length < 2 || serviceArea.trim().length > 100) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Service area must be between 2 and 100 characters' });
+      }
+      updates.serviceArea = serviceArea.trim();
+    }
+
+    if (estimatedDuration !== undefined) {
+      if (typeof estimatedDuration !== 'string' || estimatedDuration.trim().length < 2 || estimatedDuration.trim().length > 50) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Estimated duration must be between 2 and 50 characters' });
+      }
+      updates.estimatedDuration = estimatedDuration.trim();
+    }
+
+    if (image !== undefined) {
+      if (typeof image !== 'string' || !/^https?:\/\/.+/.test(image.trim())) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Valid image URL is required' });
+      }
+      updates.image = image.trim();
+    }
+
+    if (basePrice !== undefined) {
+      const priceValidation = validateMoneyAmount(basePrice, 'Base price');
+      if (!priceValidation.valid) {
+        return res.status(400).json({ error: 'Validation Error', message: priceValidation.message });
+      }
+      updates.basePrice = priceValidation.amount;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'Validation Error', message: 'No valid service content fields provided for update' });
+    }
 
     // Critical invariant: Content edits reset approval status to pending
     updates.approvalStatus = 'pending';
@@ -780,7 +1037,7 @@ app.patch('/api/services/:id', verifyToken, verifyTechnician, async (req, res, n
 app.patch('/api/services/:id/availability', verifyToken, verifyTechnician, async (req, res, next) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!id || typeof id !== 'string' || !ObjectId.isValid(id)) {
       return res.status(404).json({ error: 'Not Found', message: 'Invalid service ID format' });
     }
 
@@ -796,7 +1053,11 @@ app.patch('/api/services/:id/availability', verifyToken, verifyTechnician, async
       return res.status(403).json({ error: 'Forbidden', message: 'You do not own this service' });
     }
 
-    const isAvailable = Boolean(req.body.isAvailable);
+    if (typeof req.body.isAvailable !== 'boolean') {
+      return res.status(400).json({ error: 'Validation Error', message: 'isAvailable must be a boolean' });
+    }
+
+    const isAvailable = req.body.isAvailable;
     await servicesCollection.updateOne({ _id: new ObjectId(id) }, { $set: { isAvailable, updatedAt: new Date() } });
 
     res.status(200).json({
@@ -991,40 +1252,25 @@ app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res, next) =>
   try {
     const { serviceId, customerPhone, serviceAddress, preferredDate, problemDescription } = req.body;
 
-    if (!serviceId || !ObjectId.isValid(serviceId)) {
+    if (!serviceId || typeof serviceId !== 'string' || !ObjectId.isValid(serviceId)) {
       return res.status(400).json({ error: 'Validation Error', message: 'Valid service ID is required' });
     }
 
-    if (!customerPhone || customerPhone.trim().length < 7) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Valid contact phone number is required (min 7 digits)' });
-    }
-    if (customerPhone.trim().length > 30) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Phone number exceeds maximum limit of 30 characters' });
+    if (typeof customerPhone !== 'string' || customerPhone.trim().length < 7 || customerPhone.trim().length > 30) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Valid contact phone number is required (7 to 30 characters)' });
     }
 
-    if (!serviceAddress || serviceAddress.trim().length < 5) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Complete service address is required' });
-    }
-    if (serviceAddress.trim().length > 300) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Service address exceeds maximum limit of 300 characters' });
+    if (typeof serviceAddress !== 'string' || serviceAddress.trim().length < 5 || serviceAddress.trim().length > 300) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Complete service address is required (5 to 300 characters)' });
     }
 
-    if (!problemDescription || problemDescription.trim().length < 20) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Detailed problem description is required (min 20 characters)' });
-    }
-    if (problemDescription.trim().length > 2000) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Problem description exceeds maximum limit of 2000 characters' });
+    if (typeof problemDescription !== 'string' || problemDescription.trim().length < 20 || problemDescription.trim().length > 2000) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Detailed problem description is required (20 to 2000 characters)' });
     }
 
-    const bookingDate = new Date(preferredDate);
-    if (isNaN(bookingDate.getTime())) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Valid preferred service date is required' });
-    }
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    if (bookingDate < today) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Preferred service date must be today or in the future' });
+    const dateResult = parseAndValidateCalendarDate(preferredDate, 'Asia/Dhaka');
+    if (!dateResult.valid) {
+      return res.status(400).json({ error: 'Validation Error', message: dateResult.message });
     }
 
     const db = await getDb();
@@ -1075,7 +1321,7 @@ app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res, next) =>
       customerEmail: req.user.email,
       customerPhone: customerPhone.trim(),
       serviceAddress: serviceAddress.trim(),
-      preferredDate: bookingDate,
+      preferredDate: dateResult.date,
       problemDescription: problemDescription.trim(),
       status: 'requested',
       paymentStatus: 'unpaid',
@@ -1148,8 +1394,12 @@ app.patch('/api/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, r
     const { id } = req.params;
     const { reason } = req.body;
 
-    if (!ObjectId.isValid(id)) {
+    if (!id || typeof id !== 'string' || !ObjectId.isValid(id)) {
       return res.status(404).json({ error: 'Not Found', message: 'Invalid booking ID format' });
+    }
+
+    if (reason !== undefined && (typeof reason !== 'string' || reason.length > 500)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Cancellation reason must be a string up to 500 characters' });
     }
 
     const db = await getDb();
@@ -1173,7 +1423,7 @@ app.patch('/api/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, r
       });
     }
 
-    const cancelNote = reason?.trim() || 'Booking cancelled by customer';
+    const cancelNote = typeof reason === 'string' && reason.trim() ? reason.trim() : 'Booking cancelled by customer';
     const cancelResult = await bookingsCollection.updateOne(
       {
         _id: new ObjectId(id),
@@ -1220,8 +1470,13 @@ app.get('/api/bookings/technician', verifyToken, verifyTechnician, async (req, r
       $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }],
     };
 
-    if (req.query.status && req.query.status !== 'all') {
-      query.status = req.query.status;
+    const allowedBookingStatuses = ['requested', 'accepted', 'in-progress', 'completed', 'cancelled', 'rejected'];
+    if (typeof req.query.status === 'string') {
+      if (req.query.status === 'cancelled' || req.query.status === 'rejected') {
+        query.status = { $in: ['cancelled', 'rejected'] };
+      } else if (allowedBookingStatuses.includes(req.query.status)) {
+        query.status = req.query.status;
+      }
     }
 
     const bookings = await bookingsCollection.find(query).sort({ createdAt: -1 }).toArray();
@@ -1246,8 +1501,12 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyTechnician, async (req,
     const { id } = req.params;
     const { status: targetStatus, note, finalAmount } = req.body;
 
-    if (!ObjectId.isValid(id)) {
+    if (!id || typeof id !== 'string' || !ObjectId.isValid(id)) {
       return res.status(404).json({ error: 'Not Found', message: 'Invalid booking ID format' });
+    }
+
+    if (note !== undefined && (typeof note !== 'string' || note.length > 500)) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Note must be a string up to 500 characters' });
     }
 
     const db = await getDb();
@@ -1288,14 +1547,14 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyTechnician, async (req,
     };
 
     if (targetStatus === 'completed') {
-      const parsedAmount = parseFloat(finalAmount);
-      if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      const priceValidation = validateMoneyAmount(finalAmount, 'Final repair amount');
+      if (!priceValidation.valid) {
         return res.status(400).json({
           error: 'Validation Error',
-          message: 'Completing a repair job requires a positive final amount',
+          message: priceValidation.message,
         });
       }
-      updateFields.finalAmount = Math.round(parsedAmount * 100) / 100;
+      updateFields.finalAmount = priceValidation.amount;
     }
 
     const historyEntry = {
@@ -1303,7 +1562,7 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyTechnician, async (req,
       timestamp: new Date(),
       changedBy: req.user.email,
       role: 'technician',
-      note: note?.trim() || `Status updated to ${targetStatus}`,
+      note: typeof note === 'string' && note.trim() ? note.trim() : `Status updated to ${targetStatus}`,
     };
 
     const updateResult = await bookingsCollection.updateOne(
@@ -1429,6 +1688,7 @@ app.get('/api/stats/technician', verifyToken, verifyTechnician, async (req, res,
         inProgress,
         completed,
         totalServices: services.length,
+        approvedServices: services.filter((s) => s.approvalStatus === 'approved').length,
         totalEarnings: Math.round(totalEarnings * 100) / 100,
         recentRequests,
       },
@@ -1466,7 +1726,8 @@ app.get('/api/stats/admin', verifyToken, verifyAdmin, async (req, res, next) => 
     const activeBookingsCount = bookings.filter((b) => ['requested', 'accepted', 'in-progress'].includes(b.status)).length;
     const completedBookingsCount = bookings.filter((b) => b.status === 'completed').length;
 
-    const totalRevenue = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const totalRevenueCents = payments.reduce((sum, p) => sum + Math.round((p.amount || 0) * 100), 0);
+    const totalRevenue = totalRevenueCents / 100;
 
     const recentBookings = bookings.slice(0, 5).map((b) => ({
       id: b._id.toString(),
@@ -1598,6 +1859,73 @@ app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res, next) 
 app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
   try {
     const { name, phone, serviceArea, area, bio, image } = req.body;
+
+    const updates = { updatedAt: new Date() };
+
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 70) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Name must be a string between 2 and 70 characters' });
+      }
+      updates.name = name.trim();
+    }
+
+    if (phone !== undefined) {
+      if (phone === null || phone === '') {
+        updates.phone = null;
+      } else if (typeof phone === 'string') {
+        const trimmed = phone.trim();
+        if (trimmed.length < 7 || trimmed.length > 30) {
+          return res.status(400).json({ error: 'Validation Error', message: 'Phone number must be between 7 and 30 characters' });
+        }
+        updates.phone = trimmed;
+      } else {
+        return res.status(400).json({ error: 'Validation Error', message: 'Phone must be a valid string or empty' });
+      }
+    }
+
+    const resolvedArea = serviceArea !== undefined ? serviceArea : area;
+    if (resolvedArea !== undefined) {
+      if (resolvedArea === null || resolvedArea === '') {
+        updates.area = null;
+        updates.serviceArea = null;
+      } else if (typeof resolvedArea === 'string') {
+        const trimmedArea = resolvedArea.trim();
+        if (trimmedArea.length < 2 || trimmedArea.length > 100) {
+          return res.status(400).json({ error: 'Validation Error', message: 'Area must be between 2 and 100 characters' });
+        }
+        updates.area = trimmedArea;
+        updates.serviceArea = trimmedArea;
+      } else {
+        return res.status(400).json({ error: 'Validation Error', message: 'Area must be a valid string or empty' });
+      }
+    }
+
+    if (bio !== undefined) {
+      if (bio === null || bio === '') {
+        updates.bio = null;
+      } else if (typeof bio === 'string') {
+        if (bio.trim().length > 500) {
+          return res.status(400).json({ error: 'Validation Error', message: 'Bio cannot exceed 500 characters' });
+        }
+        updates.bio = bio.trim();
+      } else {
+        return res.status(400).json({ error: 'Validation Error', message: 'Bio must be a valid string or empty' });
+      }
+    }
+
+    if (image !== undefined) {
+      if (image === null || image === '') {
+        updates.image = null;
+      } else if (typeof image === 'string') {
+        if (!/^https?:\/\/.+/.test(image.trim())) {
+          return res.status(400).json({ error: 'Validation Error', message: 'Image must be a valid URL string or empty' });
+        }
+        updates.image = image.trim();
+      } else {
+        return res.status(400).json({ error: 'Validation Error', message: 'Image must be a valid URL string or empty' });
+      }
+    }
+
     const db = await getDb();
     const usersCollection = db.collection('user');
 
@@ -1606,23 +1934,7 @@ app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
       query.push({ _id: new ObjectId(req.user.id) });
     }
 
-    const updates = { updatedAt: new Date() };
-    if (name && typeof name === 'string') updates.name = name.trim();
-    if (phone !== undefined) updates.phone = typeof phone === 'string' ? phone.trim() : phone;
-    
-    // Synchronize both area and serviceArea fields in tandem for full schema compatibility
-    const resolvedArea = serviceArea !== undefined ? serviceArea : area;
-    if (resolvedArea !== undefined) {
-      const trimmedArea = typeof resolvedArea === 'string' ? resolvedArea.trim() : resolvedArea;
-      updates.serviceArea = trimmedArea;
-      updates.area = trimmedArea;
-    }
-
-    if (bio !== undefined) updates.bio = typeof bio === 'string' ? bio.trim() : bio;
-    if (image !== undefined) updates.image = image;
-
     await usersCollection.updateOne({ $or: query }, { $set: updates });
-
     const updatedUser = await usersCollection.findOne({ $or: query });
 
     res.status(200).json({
@@ -1653,7 +1965,7 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
   try {
     const { bookingId } = req.body;
 
-    if (!bookingId || !ObjectId.isValid(bookingId)) {
+    if (!bookingId || typeof bookingId !== 'string' || !ObjectId.isValid(bookingId)) {
       return res.status(400).json({ error: 'Validation Error', message: 'Valid booking ID is required' });
     }
 
@@ -1685,8 +1997,16 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       });
     }
 
-    const payAmount = booking.finalAmount || booking.basePrice || 10;
-    const amountInCents = Math.round(payAmount * 100);
+    const targetAmount = booking.finalAmount !== undefined ? booking.finalAmount : booking.basePrice;
+    const validated = validateMoneyAmount(targetAmount, 'Repair invoice amount');
+    if (!validated.valid) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: validated.message,
+      });
+    }
+
+    const amountInCents = validated.cents;
 
     if (!stripe) {
       return res.status(503).json({
@@ -1695,22 +2015,37 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       });
     }
 
-    // Reuse existing open Stripe checkout session if one was already issued for this booking
+    // Inspect existing Stripe checkout session if one was recorded
     if (booking.stripeSessionId) {
       try {
         const existingSession = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
-        if (existingSession && existingSession.status === 'open' && existingSession.url) {
-          return res.status(200).json({
-            url: existingSession.url,
-            sessionId: existingSession.id,
-          });
+        if (existingSession) {
+          if (existingSession.payment_status === 'paid') {
+            await fulfillPaymentSession(existingSession);
+            return res.status(200).json({
+              url: null,
+              alreadyPaid: true,
+              sessionId: existingSession.id,
+              bookingId: booking._id.toString(),
+              message: 'This booking has already been paid and reconciled.',
+            });
+          }
+          if (existingSession.status === 'open' && existingSession.url) {
+            return res.status(200).json({
+              url: existingSession.url,
+              sessionId: existingSession.id,
+            });
+          }
         }
       } catch (err) {
-        // If expired or retrieval error, proceed to create new session
+        // Transient error or session expired
+        console.warn('Existing session retrieval warning:', err.message);
       }
     }
 
-    const clientOrigin = req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
+    // Previous attempt is confirmed not open/paid, advance attempt generation
+    const nextGeneration = (booking.checkoutGeneration || 1) + 1;
+    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -1734,21 +2069,30 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
         client_reference_id: booking._id.toString(),
         metadata: {
           bookingId: booking._id.toString(),
-          customerId: req.user.id,
+          customerId: req.user.id || '',
+          customerEmail: req.user.email,
           technicianEmail: booking.technicianEmail,
           serviceTitle: booking.serviceTitle,
+          generation: String(nextGeneration),
         },
-        success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
-        cancel_url: `${clientOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
+        success_url: `${canonicalOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
+        cancel_url: `${canonicalOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
       },
       {
-        idempotencyKey: `checkout_${booking._id.toString()}_${amountInCents}`,
+        idempotencyKey: `checkout_${booking._id.toString()}_gen${nextGeneration}_${amountInCents}`,
       }
     );
 
     await bookingsCollection.updateOne(
       { _id: new ObjectId(bookingId) },
-      { $set: { stripeSessionId: session.id, updatedAt: new Date() } }
+      {
+        $set: {
+          stripeSessionId: session.id,
+          checkoutGeneration: nextGeneration,
+          checkoutSessionUrl: session.url,
+          updatedAt: new Date(),
+        },
+      }
     );
 
     res.status(200).json({
@@ -1765,12 +2109,13 @@ app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res, ne
   try {
     const { session_id, booking_id } = req.query;
 
-    if (!session_id || !booking_id || !ObjectId.isValid(booking_id)) {
+    if (!session_id || !booking_id || typeof booking_id !== 'string' || !ObjectId.isValid(booking_id)) {
       return res.status(400).json({ error: 'Validation Error', message: 'session_id and valid booking_id are required' });
     }
 
     const db = await getDb();
     const bookingsCollection = db.collection('bookings');
+    const paymentsCollection = db.collection('payments');
 
     const bookingDoc = await bookingsCollection.findOne({ _id: new ObjectId(booking_id) });
     if (!bookingDoc) {
@@ -1805,9 +2150,21 @@ app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res, ne
       });
     }
 
+    const payment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+
     res.status(200).json({
       success: true,
       booking,
+      payment: payment ? {
+        id: payment._id.toString(),
+        stripeSessionId: payment.stripeSessionId,
+        stripePaymentIntentId: payment.stripePaymentIntentId,
+        transactionId: payment.stripePaymentIntentId || payment.stripeSessionId,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        createdAt: payment.createdAt,
+      } : null,
       message: 'Payment verified and booking updated to paid',
     });
   } catch (err) {
@@ -1830,6 +2187,7 @@ app.get('/api/payments/my', verifyToken, verifyCustomer, async (req, res, next) 
       ...p,
       id: p._id.toString(),
       _id: p._id.toString(),
+      transactionId: p.stripePaymentIntentId || p.stripeSessionId,
       createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : p.createdAt,
     }));
 
@@ -1845,20 +2203,40 @@ app.get('/api/admin/payments', verifyToken, verifyAdmin, async (req, res, next) 
     const db = await getDb();
     const paymentsCollection = db.collection('payments');
 
-    const payments = await paymentsCollection.find({}).sort({ createdAt: -1 }).toArray();
+    const query = {};
+    if (req.query.search && typeof req.query.search === 'string') {
+      const trimmed = req.query.search.trim();
+      if (trimmed) {
+        const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        query.$or = [
+          { stripeSessionId: { $regex: escaped, $options: 'i' } },
+          { stripePaymentIntentId: { $regex: escaped, $options: 'i' } },
+          { customerEmail: { $regex: escaped, $options: 'i' } },
+          { customerName: { $regex: escaped, $options: 'i' } },
+          { serviceTitle: { $regex: escaped, $options: 'i' } },
+          { bookingId: { $regex: escaped, $options: 'i' } },
+        ];
+      }
+    }
 
-    const totalRevenue = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const payments = await paymentsCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+    // Succeeded payments invariant for authoritative platform revenue
+    const succeededPayments = payments.filter((p) => p.status === 'succeeded');
+    const totalRevenueCents = succeededPayments.reduce((sum, p) => sum + Math.round((p.amount || 0) * 100), 0);
+    const totalRevenue = totalRevenueCents / 100;
 
     const formatted = payments.map((p) => ({
       ...p,
       id: p._id.toString(),
       _id: p._id.toString(),
+      transactionId: p.stripePaymentIntentId || p.stripeSessionId,
       createdAt: p.createdAt instanceof Date ? p.createdAt.toISOString() : p.createdAt,
     }));
 
     res.status(200).json({
       data: formatted,
-      totalRevenue: Math.round(totalRevenue * 100) / 100,
+      totalRevenue,
       total: formatted.length,
     });
   } catch (err) {
