@@ -119,17 +119,50 @@ export async function fulfillPaymentSession(session) {
     return null;
   }
 
-  // 6. If booking is already paid or payment record exists, return idempotent success
+  // 6. If booking is already paid, return idempotent success
   if (booking.paymentStatus === 'paid') {
     return booking;
   }
+
+  // Check if payment ledger record already exists (e.g. from prior webhook or interrupted write)
   const existingBookingPayment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
   if (existingBookingPayment) {
-    return booking;
+    // Reconcile booking from existing authoritative payment ledger record
+    if (existingBookingPayment.status === 'succeeded') {
+      const settledAmount = typeof existingBookingPayment.amount === 'number'
+        ? existingBookingPayment.amount
+        : paidCents / 100;
+
+      await bookingsCollection.updateOne(
+        { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
+        {
+          $set: {
+            paymentStatus: 'paid',
+            stripePaymentIntentId: existingBookingPayment.stripePaymentIntentId || session.payment_intent || null,
+            stripeSessionId: existingBookingPayment.stripeSessionId || session.id,
+            paidAt: existingBookingPayment.createdAt || new Date(),
+            updatedAt: new Date(),
+          },
+          $push: {
+            statusHistory: {
+              status: 'paid',
+              timestamp: existingBookingPayment.createdAt || new Date(),
+              changedBy: booking.customerEmail,
+              role: 'customer',
+              note: `Payment of $${Number(settledAmount).toFixed(2)} completed successfully via Stripe`,
+            },
+          },
+        }
+      );
+
+      return await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+    }
   }
 
   // 7. Enforce exactly-once payment ledger insertion (unique on bookingId)
   const paidAmount = (paidCents / 100).toFixed(2);
+  let authoritativePayment = null;
+
   try {
     await paymentsCollection.insertOne({
       stripeSessionId: session.id,
@@ -146,36 +179,52 @@ export async function fulfillPaymentSession(session) {
       status: 'succeeded',
       createdAt: new Date(),
     });
+    authoritativePayment = {
+      stripeSessionId: session.id,
+      stripePaymentIntentId: session.payment_intent || null,
+      amount: paidCents / 100,
+      createdAt: new Date(),
+    };
   } catch (err) {
-    if (err.code !== 11000 && !err.message?.includes('duplicate key')) {
+    if (err.code === 11000 || err.message?.includes('duplicate key')) {
+      // In case of race condition or duplicate key, load authoritative existing payment
+      authoritativePayment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+    } else {
       throw err;
     }
   }
 
-  // 8. Atomic exactly-once update on booking record
+  const finalPayment = authoritativePayment || {
+    stripeSessionId: session.id,
+    stripePaymentIntentId: session.payment_intent || null,
+    amount: paidCents / 100,
+    createdAt: new Date(),
+  };
+
+  // 8. Atomic exactly-once update on booking record (reconciliation safe)
   await bookingsCollection.updateOne(
     { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
     {
       $set: {
         paymentStatus: 'paid',
-        stripePaymentIntentId: session.payment_intent || null,
-        stripeSessionId: session.id,
-        paidAt: new Date(),
+        stripePaymentIntentId: finalPayment.stripePaymentIntentId || null,
+        stripeSessionId: finalPayment.stripeSessionId || null,
+        paidAt: finalPayment.createdAt || new Date(),
         updatedAt: new Date(),
       },
       $push: {
         statusHistory: {
           status: 'paid',
-          timestamp: new Date(),
+          timestamp: finalPayment.createdAt || new Date(),
           changedBy: booking.customerEmail,
           role: 'customer',
-          note: `Payment of $${paidAmount} completed successfully via Stripe`,
+          note: `Payment of $${Number(finalPayment.amount).toFixed(2)} completed successfully via Stripe`,
         },
       },
     }
   );
 
-  return bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+  return await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
 }
 
 // Stripe webhook route mounted before JSON body parser to preserve raw buffer
@@ -279,7 +328,7 @@ export async function connectToDatabase() {
       .then(async (connectedClient) => {
         cachedClient = connectedClient;
         cachedDb = connectedClient.db(MONGODB_DBNAME);
-        ensureDatabaseIndexes(cachedDb).catch((e) => console.warn('Indexes deferred:', e.message));
+        await ensureDatabaseIndexes(cachedDb);
         return { client: cachedClient, db: cachedDb };
       })
       .catch((err) => {
@@ -877,15 +926,40 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
       });
     }
 
-    // Strictly validate base64 image data and payload size limit (max 5MB)
+    // Strictly decode base64 data and inspect real image magic bytes
     const base64Match = image.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/);
     const base64Data = base64Match ? base64Match[2] : image.replace(/^data:image\/\w+;base64,/, '');
 
-    const estimatedSizeBytes = base64Data.length * 0.75;
-    if (estimatedSizeBytes > 5 * 1024 * 1024) {
+    let buffer;
+    try {
+      buffer = Buffer.from(base64Data, 'base64');
+    } catch {
+      return res.status(400).json({ error: 'Validation Error', message: 'Invalid base64 payload' });
+    }
+
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ error: 'Validation Error', message: 'Empty image buffer received' });
+    }
+
+    if (buffer.length > 5 * 1024 * 1024) {
       return res.status(400).json({
         error: 'Validation Error',
         message: 'Image size exceeds maximum limit of 5MB',
+      });
+    }
+
+    // Inspect magic bytes: JPEG (FF D8 FF), PNG (89 50 4E 47), WebP (RIFF....WEBP)
+    const isJpeg = buffer.length > 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    const isPng = buffer.length > 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+    const isWebp =
+      buffer.length > 12 &&
+      buffer.toString('ascii', 0, 4) === 'RIFF' &&
+      buffer.toString('ascii', 8, 12) === 'WEBP';
+
+    if (!isJpeg && !isPng && !isWebp) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Uploaded file is not a supported image. Only authentic JPEG, PNG, and WebP files are accepted.',
       });
     }
 
@@ -1526,7 +1600,7 @@ app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res, next) 
 // PATCH /api/users/profile - Authenticated user update own profile
 app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
   try {
-    const { name, phone, serviceArea, bio, image } = req.body;
+    const { name, phone, serviceArea, area, bio, image } = req.body;
     const db = await getDb();
     const usersCollection = db.collection('user');
 
@@ -1538,7 +1612,15 @@ app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
     const updates = { updatedAt: new Date() };
     if (name && typeof name === 'string') updates.name = name.trim();
     if (phone !== undefined) updates.phone = typeof phone === 'string' ? phone.trim() : phone;
-    if (serviceArea !== undefined) updates.serviceArea = typeof serviceArea === 'string' ? serviceArea.trim() : serviceArea;
+    
+    // Synchronize both area and serviceArea fields in tandem for full schema compatibility
+    const resolvedArea = serviceArea !== undefined ? serviceArea : area;
+    if (resolvedArea !== undefined) {
+      const trimmedArea = typeof resolvedArea === 'string' ? resolvedArea.trim() : resolvedArea;
+      updates.serviceArea = trimmedArea;
+      updates.area = trimmedArea;
+    }
+
     if (bio !== undefined) updates.bio = typeof bio === 'string' ? bio.trim() : bio;
     if (image !== undefined) updates.image = image;
 
@@ -1554,7 +1636,8 @@ app.patch('/api/users/profile', verifyToken, async (req, res, next) => {
         role: updatedUser.role || 'customer',
         image: updatedUser.image || null,
         phone: updatedUser.phone || null,
-        serviceArea: updatedUser.serviceArea || null,
+        serviceArea: updatedUser.serviceArea || updatedUser.area || null,
+        area: updatedUser.area || updatedUser.serviceArea || null,
         bio: updatedUser.bio || null,
       },
       message: 'Profile updated successfully',
@@ -1717,6 +1800,13 @@ app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res, ne
     }
 
     const booking = await fulfillPaymentSession(session);
+
+    if (!booking || booking.paymentStatus !== 'paid') {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Payment verification failed: session could not be fulfilled due to status or amount mismatch',
+      });
+    }
 
     res.status(200).json({
       success: true,
