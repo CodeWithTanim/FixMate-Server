@@ -947,6 +947,9 @@ export async function verifyToken(req, res, next) {
     if (ObjectId.isValid(sub)) {
       query.push({ _id: new ObjectId(sub) });
     }
+    if (decoded.email) {
+      query.push({ email: decoded.email.toLowerCase() });
+    }
 
     const user = await usersCollection.findOne({ $or: query });
 
