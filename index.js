@@ -1,3 +1,4 @@
+import { prepareCheckoutAttempt } from './checkout-attempt.js';
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -2585,16 +2586,52 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
       }
     }
 
-    // 3. Atomically claim attempt generation with expected-state condition
-    // For stale creating attempts, reclaim the SAME generation & key rather than advancing
-    const isReclaim = existingUser.activeSubAttempt?.status === 'creating';
-    const currentGen = existingUser.activeSubAttempt?.generation || existingUser.subAttemptGeneration || 0;
-    const targetGen = isReclaim ? (existingUser.activeSubAttempt.generation || 1) : (currentGen + 1);
-    const attemptId = isReclaim && existingUser.activeSubAttempt.attemptId ? existingUser.activeSubAttempt.attemptId : new ObjectId().toString();
-    const attemptKey = isReclaim && existingUser.activeSubAttempt.key ? existingUser.activeSubAttempt.key : `pro_sub_${req.user.email}_gen_${targetGen}`;
+    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
 
+    const attempt = prepareCheckoutAttempt({
+      previous: existingUser.activeSubAttempt, generation: existingUser.subAttemptGeneration,
+      prefix: 'pro_sub', resourceId: existingUser._id.toString(),
+      buildParams: (generation) => ({
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: {
+                name: 'FixMate Pro Technician Membership',
+                description: 'Monthly Pro subscription: 0% platform fee, priority algorithm placement & Golden PRO crown badge',
+              },
+              unit_amount: 2900, // $29.00
+              recurring: {
+                interval: 'month',
+              },
+            },
+            quantity: 1,
+          },
+        ],
+        mode: 'subscription',
+        customer_email: req.user.email,
+        client_reference_id: req.user.email,
+        metadata: {
+          type: 'pro_subscription',
+          technicianEmail: req.user.email,
+          technicianId: req.user.id || '',
+          tier: 'pro',
+          amount: '29.00',
+          generation: String(generation),
+        },
+        success_url: `${canonicalOrigin}/dashboard/technician/subscription?session_id={CHECKOUT_SESSION_ID}&status=success`,
+        cancel_url: `${canonicalOrigin}/dashboard/technician/subscription?status=cancelled`,
+      }),
+    });
+    const { attemptId, generation: targetGen, key: attemptKey, params: checkoutParams } = attempt;
+    if (checkoutParams.line_items?.[0]?.price_data?.unit_amount !== 2900) {
+      return res.status(409).json({ error: 'Conflict', message: 'The invoice changed while checkout was being created. Please contact support before starting another payment.' });
+    }
+
+    // Claim this exact generation before sending the frozen request to Stripe.
     const userUpdate = await usersCollection.findOneAndUpdate(
       {
+        subAttemptGeneration: existingUser.subAttemptGeneration === undefined ? { $exists: false } : existingUser.subAttemptGeneration,
         email: req.user.email,
         role: 'technician',
         isPro: { $ne: true },
@@ -2608,6 +2645,8 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
         $set: {
           'activeSubAttempt.attemptId': attemptId,
           'activeSubAttempt.key': attemptKey,
+          'activeSubAttempt.requestVersion': attempt.requestVersion,
+          'activeSubAttempt.params': checkoutParams,
           'activeSubAttempt.status': 'creating',
           'activeSubAttempt.generation': targetGen,
           'activeSubAttempt.claimedAt': new Date(),
@@ -2635,47 +2674,10 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
       });
     }
 
-    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
+    const session = await stripe.checkout.sessions.create(checkoutParams, { idempotencyKey: attemptKey });
 
-    const session = await stripe.checkout.sessions.create(
-      {
-        line_items: [
-          {
-            price_data: {
-              currency: 'usd',
-              product_data: {
-                name: 'FixMate Pro Technician Membership',
-                description: 'Monthly Pro subscription: 0% platform fee, priority algorithm placement & Golden PRO crown badge',
-              },
-              unit_amount: 2900, // $29.00
-              recurring: {
-                interval: 'month',
-              },
-            },
-            quantity: 1,
-          },
-        ],
-        mode: 'subscription',
-        customer_email: req.user.email,
-        client_reference_id: req.user.email,
-        metadata: {
-          type: 'pro_subscription',
-          technicianEmail: req.user.email,
-          technicianId: req.user.id || '',
-          tier: 'pro',
-          amount: '29.00',
-          generation: String(targetGen),
-        },
-        success_url: `${canonicalOrigin}/dashboard/technician/subscription?session_id={CHECKOUT_SESSION_ID}&status=success`,
-        cancel_url: `${canonicalOrigin}/dashboard/technician/subscription?status=cancelled`,
-      },
-      {
-        idempotencyKey: attemptKey,
-      }
-    );
-
-    await usersCollection.updateOne(
-      { email: req.user.email, role: 'technician', 'activeSubAttempt.attemptId': attemptId },
+    const savedAttempt = await usersCollection.updateOne(
+      { _id: existingUser._id, 'activeSubAttempt.attemptId': attemptId, 'activeSubAttempt.key': attemptKey, 'activeSubAttempt.status': 'creating' },
       {
         $set: {
           'activeSubAttempt.status': 'open',
@@ -2686,6 +2688,14 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
         },
       }
     );
+
+    if (!savedAttempt.matchedCount) {
+      const current = await usersCollection.findOne({ _id: existingUser._id });
+      if (current?.activeSubAttempt?.status !== 'open' || current.activeSubAttempt.sessionId !== session.id) {
+        await stripe.checkout.sessions.expire(session.id).catch(() => {});
+        return res.status(409).json({ error: 'Conflict', message: 'Checkout was updated by another request. Please retry.' });
+      }
+    }
 
     res.status(200).json({
       success: true,
@@ -3188,18 +3198,58 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       }
     }
 
-    // 3. Atomically claim attempt generation from expected state
-    // For stale creating attempts, reclaim the SAME generation & key rather than advancing
-    const isReclaim = booking.activeAttempt?.status === 'creating';
-    const currentGeneration = booking.activeAttempt?.generation || booking.checkoutGeneration || 0;
-    const targetGeneration = isReclaim ? (booking.activeAttempt.generation || 1) : (currentGeneration + 1);
-    const attemptId = isReclaim && booking.activeAttempt.attemptId ? booking.activeAttempt.attemptId : new ObjectId().toString();
-    const attemptKey = isReclaim && booking.activeAttempt.key
-      ? booking.activeAttempt.key
-      : `checkout_${booking._id.toString()}_gen_${targetGeneration}_${amountInCents}`;
+    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
 
+    // Stripe product_data.images only accepts public http/https URLs up to 2048 chars (rejects base64 data: URIs)
+    const stripeImages =
+      booking.serviceImage &&
+      /^https?:\/\/.+/.test(booking.serviceImage) &&
+      booking.serviceImage.length <= 2048
+        ? [booking.serviceImage]
+        : [];
+
+    const attempt = prepareCheckoutAttempt({
+      previous: booking.activeAttempt, generation: booking.checkoutGeneration,
+      prefix: 'checkout', resourceId: booking._id.toString(),
+      buildParams: (generation) => ({
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: {
+                name: `FixMate: ${booking.serviceTitle}`,
+                description: `Completed repair service by ${booking.technicianName}`,
+                images: stripeImages,
+              },
+              unit_amount: amountInCents,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: 'payment',
+        customer_email: req.user.email,
+        client_reference_id: booking._id.toString(),
+        metadata: {
+          bookingId: booking._id.toString(),
+          customerId: req.user.id || '',
+          customerEmail: req.user.email,
+          technicianEmail: booking.technicianEmail,
+          serviceTitle: booking.serviceTitle,
+          generation: String(generation),
+        },
+        success_url: `${canonicalOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
+        cancel_url: `${canonicalOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
+      }),
+    });
+    const { attemptId, generation: targetGeneration, key: attemptKey, params: checkoutParams } = attempt;
+    if (checkoutParams.line_items?.[0]?.price_data?.unit_amount !== amountInCents) {
+      return res.status(409).json({ error: 'Conflict', message: 'The invoice changed while checkout was being created. Please contact support before starting another payment.' });
+    }
+
+    // Claim this exact generation before sending the frozen request to Stripe.
     const claimedBooking = await bookingsCollection.findOneAndUpdate(
       {
+        checkoutGeneration: booking.checkoutGeneration === undefined ? { $exists: false } : booking.checkoutGeneration,
         _id: new ObjectId(bookingId),
         status: 'completed',
         paymentStatus: 'unpaid',
@@ -3213,6 +3263,8 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
         $set: {
           'activeAttempt.attemptId': attemptId,
           'activeAttempt.key': attemptKey,
+          'activeAttempt.requestVersion': attempt.requestVersion,
+          'activeAttempt.params': checkoutParams,
           'activeAttempt.status': 'creating',
           'activeAttempt.generation': targetGeneration,
           'activeAttempt.amountInCents': amountInCents,
@@ -3242,53 +3294,10 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       });
     }
 
-    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
+    const session = await stripe.checkout.sessions.create(checkoutParams, { idempotencyKey: attemptKey });
 
-    // Stripe product_data.images only accepts public http/https URLs up to 2048 chars (rejects base64 data: URIs)
-    const stripeImages =
-      booking.serviceImage &&
-      /^https?:\/\/.+/.test(booking.serviceImage) &&
-      booking.serviceImage.length <= 2048
-        ? [booking.serviceImage]
-        : [];
-
-    const session = await stripe.checkout.sessions.create(
-      {
-        line_items: [
-          {
-            price_data: {
-              currency: 'usd',
-              product_data: {
-                name: `FixMate: ${booking.serviceTitle}`,
-                description: `Completed repair service by ${booking.technicianName}`,
-                images: stripeImages,
-              },
-              unit_amount: amountInCents,
-            },
-            quantity: 1,
-          },
-        ],
-        mode: 'payment',
-        customer_email: req.user.email,
-        client_reference_id: booking._id.toString(),
-        metadata: {
-          bookingId: booking._id.toString(),
-          customerId: req.user.id || '',
-          customerEmail: req.user.email,
-          technicianEmail: booking.technicianEmail,
-          serviceTitle: booking.serviceTitle,
-          generation: String(targetGeneration),
-        },
-        success_url: `${canonicalOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
-        cancel_url: `${canonicalOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
-      },
-      {
-        idempotencyKey: attemptKey,
-      }
-    );
-
-    await bookingsCollection.updateOne(
-      { _id: new ObjectId(bookingId), 'activeAttempt.attemptId': attemptId },
+    const savedAttempt = await bookingsCollection.updateOne(
+      { _id: new ObjectId(bookingId), 'activeAttempt.attemptId': attemptId, 'activeAttempt.key': attemptKey, 'activeAttempt.status': 'creating' },
       {
         $set: {
           'activeAttempt.status': 'open',
@@ -3310,6 +3319,14 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
         },
       }
     );
+
+    if (!savedAttempt.matchedCount) {
+      const current = await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
+      if (current?.activeAttempt?.status !== 'open' || current.activeAttempt.sessionId !== session.id) {
+        await stripe.checkout.sessions.expire(session.id).catch(() => {});
+        return res.status(409).json({ error: 'Conflict', message: 'Checkout was updated by another request. Please retry.' });
+      }
+    }
 
     res.status(200).json({
       url: session.url,
