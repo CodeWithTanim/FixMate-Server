@@ -284,7 +284,7 @@ export async function fulfillPaymentSession(session) {
 
   // Calculate immutable settlement fee snapshot based on technician tier AT SETTLEMENT TIME
   const usersCollection = db.collection('user');
-  const technicianUser = await usersCollection.findOne({ email: booking.technicianEmail });
+  const technicianUser = await usersCollection.findOne({ email: booking.technicianEmail, role: 'technician' });
   const isPro = !!technicianUser?.isPro;
   const platformFeeRate = isPro ? 0 : 10;
   const feeMultiplier = isPro ? 0 : 0.10;
@@ -425,7 +425,7 @@ export async function fulfillSubscriptionSession(session) {
   const servicesCollection = db.collection('services');
   const paymentsCollection = db.collection('payments');
 
-  const user = await usersCollection.findOne({ email: technicianEmail });
+  const user = await usersCollection.findOne({ email: technicianEmail, role: 'technician' });
   if (!user || user.role !== 'technician') {
     console.error('User not found or not a technician:', technicianEmail);
     return null;
@@ -502,7 +502,7 @@ export async function fulfillSubscriptionSession(session) {
 
   // 2. Update user state (unsetting cancelledAt and setting Pro)
   await usersCollection.updateOne(
-    { email: technicianEmail },
+    { email: technicianEmail, role: 'technician' },
     {
       $set: {
         isPro: true,
@@ -827,7 +827,7 @@ export async function ensureDatabaseIndexes(db) {
       options: { unique: true, partialFilterExpression: { bookingId: { $type: 'string' } }, name: 'unique_booking_payment' },
     },
     { coll: 'payments', spec: { customerEmail: 1, createdAt: -1 } },
-    { coll: 'user', spec: { email: 1 }, options: { unique: true, sparse: true } },
+    { coll: 'user', spec: { email: 1, role: 1 }, options: { unique: true, name: 'user_email_role_uidx' } },
   ];
 
   await Promise.all(
@@ -946,9 +946,6 @@ export async function verifyToken(req, res, next) {
     const query = [{ id: sub }, { _id: sub }];
     if (ObjectId.isValid(sub)) {
       query.push({ _id: new ObjectId(sub) });
-    }
-    if (decoded.email) {
-      query.push({ email: decoded.email.toLowerCase() });
     }
 
     const user = await usersCollection.findOne({ $or: query });
@@ -1227,7 +1224,7 @@ app.get('/api/services/:id', async (req, res, next) => {
     }
 
     if (techUserQuery.length > 0) {
-      const techUser = await usersCollection.findOne({ $or: techUserQuery });
+      const techUser = await usersCollection.findOne({ $or: techUserQuery, role: 'technician' });
       if (techUser) {
         technicianProfile = {
           id: techUser.id || techUser._id.toString(),
@@ -1313,7 +1310,7 @@ app.post('/api/services', verifyToken, verifyTechnician, async (req, res, next) 
     const servicesCollection = db.collection('services');
     const usersCollection = db.collection('user');
 
-    const technicianDoc = await usersCollection.findOne({ email: req.user.email });
+    const technicianDoc = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
     const isPro = !!technicianDoc?.isPro;
 
     // Enforce 5-service limit for Standard tier technicians
@@ -2129,7 +2126,7 @@ app.get('/api/stats/technician', verifyToken, verifyTechnician, async (req, res,
       servicesCollection
         .find({ $or: [{ technicianEmail: req.user.email }, { technicianId: req.user.id }] })
         .toArray(),
-      usersCollection.findOne({ email: req.user.email }),
+      usersCollection.findOne({ email: req.user.email, role: 'technician' }),
     ]);
 
     const isPro = !!technicianUser?.isPro;
@@ -2478,7 +2475,7 @@ app.get('/api/technician/subscription', verifyToken, verifyTechnician, async (re
   try {
     const db = await getDb();
     const usersCollection = db.collection('user');
-    const user = await usersCollection.findOne({ email: req.user.email });
+    const user = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
 
     res.status(200).json({
       success: true,
@@ -2511,7 +2508,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
     const db = await getDb();
     const usersCollection = db.collection('user');
 
-    const existingUser = await usersCollection.findOne({ email: req.user.email });
+    const existingUser = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
     if (!existingUser || existingUser.role !== 'technician') {
       return res.status(403).json({ error: 'Forbidden', message: 'Only technicians can purchase Pro memberships.' });
     }
@@ -2549,7 +2546,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
           if (existingSession.status === 'expired') {
             isConfirmedExpired = true;
             await usersCollection.updateOne(
-              { email: req.user.email, 'activeSubAttempt.sessionId': existingSessionId },
+              { email: req.user.email, role: 'technician', 'activeSubAttempt.sessionId': existingSessionId },
               { $set: { 'activeSubAttempt.status': 'expired', 'activeSubAttempt.expiredAt': new Date(), updatedAt: new Date() } }
             );
             if (existingUser.activeSubAttempt) {
@@ -2574,7 +2571,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
       if (Date.now() - claimedAt < 15000) {
         for (let i = 0; i < 6; i++) {
           await new Promise((r) => setTimeout(r, 500));
-          const refreshedUser = await usersCollection.findOne({ email: req.user.email });
+          const refreshedUser = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
           if (refreshedUser?.activeSubAttempt?.status === 'open' && refreshedUser.activeSubAttempt.sessionUrl) {
             return res.status(200).json({
               url: refreshedUser.activeSubAttempt.sessionUrl,
@@ -2621,7 +2618,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
       { returnDocument: 'after' }
     );
     if (!userUpdate) {
-      const concurrentUser = await usersCollection.findOne({ email: req.user.email });
+      const concurrentUser = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
       if (
         concurrentUser?.activeSubAttempt?.status === 'open' &&
         concurrentUser.activeSubAttempt.sessionUrl &&
@@ -2679,7 +2676,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
     );
 
     await usersCollection.updateOne(
-      { email: req.user.email, 'activeSubAttempt.attemptId': attemptId },
+      { email: req.user.email, role: 'technician', 'activeSubAttempt.attemptId': attemptId },
       {
         $set: {
           'activeSubAttempt.status': 'open',
@@ -2753,7 +2750,7 @@ app.get('/api/technician/subscription/verify', verifyToken, verifyTechnician, as
 
     const db = await getDb();
     const usersCollection = db.collection('user');
-    const existingUser = await usersCollection.findOne({ email: req.user.email });
+    const existingUser = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
 
     // Prevent replaying an old session from a previously cancelled billing cycle
     if (existingUser?.cancelledAt && session.created) {
@@ -2793,7 +2790,7 @@ app.post('/api/technician/subscription/cancel', verifyToken, verifyTechnician, a
     const usersCollection = db.collection('user');
     const servicesCollection = db.collection('services');
 
-    const user = await usersCollection.findOne({ email: req.user.email });
+    const user = await usersCollection.findOne({ email: req.user.email, role: 'technician' });
     if (user?.stripeSubscriptionId && stripe) {
       try {
         await stripe.subscriptions.cancel(user.stripeSubscriptionId);
@@ -2814,7 +2811,7 @@ app.post('/api/technician/subscription/cancel', verifyToken, verifyTechnician, a
 
     const now = new Date();
     await usersCollection.updateOne(
-      { email: req.user.email },
+      { email: req.user.email, role: 'technician' },
       {
         $set: {
           isPro: false,
@@ -2901,7 +2898,22 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res
       return res.status(400).json({ error: 'Forbidden', message: 'Admins cannot change their own role' });
     }
 
-    await usersCollection.updateOne({ _id: targetUser._id }, { $set: { role, updatedAt: new Date() } });
+    const conflict = await usersCollection.findOne({ email: targetUser.email, role, _id: { $ne: targetUser._id } });
+    if (conflict) return res.status(409).json({ error: 'Conflict', message: 'An account with this email and role already exists.' });
+
+    const session = db.client.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await usersCollection.updateOne({ _id: targetUser._id }, { $set: { role, updatedAt: new Date() } }, { session });
+        await db.collection('account').updateMany(
+          { userId: { $in: [targetUser._id, String(targetUser._id), ...(targetUser.id ? [targetUser.id] : [])] } },
+          { $set: { accountRole: role } },
+          { session }
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
 
     res.status(200).json({
       success: true,
@@ -3385,7 +3397,7 @@ app.get('/api/payments/my', verifyToken, verifyCustomer, async (req, res, next) 
     const paymentsCollection = db.collection('payments');
 
     const payments = await paymentsCollection
-      .find({ customerEmail: req.user.email })
+      .find({ customerEmail: req.user.email, type: { $nin: ['subscription', 'subscription_renewal'] } })
       .sort({ createdAt: -1 })
       .toArray();
 
