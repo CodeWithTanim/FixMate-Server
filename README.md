@@ -1,4 +1,4 @@
-# ⚡ FixMate — Backend RESTful API & Payment Engine
+# FixMate - Backend
 
 <div align="center">
 
@@ -207,11 +207,12 @@ MONGODB_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/fixmate-db?r
 MONGODB_DBNAME=fixmate-db
 
 # Cross-Origin Resource Sharing (CORS)
-CORS_ORIGINS=http://localhost:3000,https://fix-mate-flame.vercel.app
+CORS_ORIGINS=https://fix-mate-flame.vercel.app,http://localhost:3000
+CLIENT_URL=https://fix-mate-flame.vercel.app
 
 # Security & Authorization (Shared with Next.js Client)
 JWT_SECRET=your_shared_jwt_secret_with_express_backend_min_32_chars
-JWT_ISSUER=http://localhost:3000
+JWT_ISSUER=https://fix-mate-flame.vercel.app
 JWT_AUDIENCE=fixmate-api
 
 # Stripe Payments (Test Mode Only)

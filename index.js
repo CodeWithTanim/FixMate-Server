@@ -11,9 +11,9 @@ const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DBNAME = process.env.MONGODB_DBNAME || 'fixmate-db';
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
-  : (process.env.NODE_ENV === 'production' ? [] : ['http://localhost:3000', 'http://127.0.0.1:3000']);
+  : ['https://fix-mate-flame.vercel.app', 'http://localhost:3000', 'http://127.0.0.1:3000'];
 const JWT_SECRET = process.env.JWT_SECRET || '';
-const JWT_ISSUER = process.env.JWT_ISSUER || 'http://localhost:3000';
+const JWT_ISSUER = process.env.JWT_ISSUER || 'https://fix-mate-flame.vercel.app';
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || 'fixmate-api';
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
@@ -2635,7 +2635,7 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
       });
     }
 
-    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
+    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -3228,7 +3228,7 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       });
     }
 
-    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
+    const canonicalOrigin = process.env.CLIENT_URL || req.headers.origin || CORS_ORIGINS[0] || 'https://fix-mate-flame.vercel.app';
 
     // Stripe product_data.images only accepts public http/https URLs up to 2048 chars (rejects base64 data: URIs)
     const stripeImages =
