@@ -2639,7 +2639,6 @@ app.post('/api/technician/subscription/checkout', verifyToken, verifyTechnician,
 
     const session = await stripe.checkout.sessions.create(
       {
-        payment_method_types: ['card'],
         line_items: [
           {
             price_data: {
@@ -3255,7 +3254,6 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
 
     const session = await stripe.checkout.sessions.create(
       {
-        payment_method_types: ['card'],
         line_items: [
           {
             price_data: {
