@@ -273,34 +273,30 @@ let indexesInitialized = false;
 
 export async function ensureDatabaseIndexes(db) {
   if (indexesInitialized) return;
-  try {
-    await Promise.all([
-      db.collection('services').createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 }),
-      db.collection('services').createIndex({ technicianEmail: 1, createdAt: -1 }),
-      db.collection('bookings').createIndex({ customerEmail: 1, createdAt: -1 }),
-      db.collection('bookings').createIndex({ technicianEmail: 1, status: 1 }),
-      db.collection('bookings').createIndex(
-        { customerEmail: 1, serviceId: 1 },
-        {
-          unique: true,
-          partialFilterExpression: {
-            status: { $in: ['requested', 'accepted', 'in-progress'] },
-          },
-          name: 'unique_active_customer_service_booking',
-        }
-      ),
-      db.collection('payments').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
-      db.collection('payments').createIndex(
-        { bookingId: 1 },
-        { unique: true, name: 'unique_booking_payment' }
-      ),
-      db.collection('payments').createIndex({ customerEmail: 1, createdAt: -1 }),
-      db.collection('user').createIndex({ email: 1 }, { unique: true, sparse: true }),
-    ]);
-    indexesInitialized = true;
-  } catch (err) {
-    console.warn('Index initialization notice:', err.message);
-  }
+  await Promise.all([
+    db.collection('services').createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 }),
+    db.collection('services').createIndex({ technicianEmail: 1, createdAt: -1 }),
+    db.collection('bookings').createIndex({ customerEmail: 1, createdAt: -1 }),
+    db.collection('bookings').createIndex({ technicianEmail: 1, status: 1 }),
+    db.collection('bookings').createIndex(
+      { customerEmail: 1, serviceId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          status: { $in: ['requested', 'accepted', 'in-progress'] },
+        },
+        name: 'unique_active_customer_service_booking',
+      }
+    ),
+    db.collection('payments').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
+    db.collection('payments').createIndex(
+      { bookingId: 1 },
+      { unique: true, name: 'unique_booking_payment' }
+    ),
+    db.collection('payments').createIndex({ customerEmail: 1, createdAt: -1 }),
+    db.collection('user').createIndex({ email: 1 }, { unique: true, sparse: true }),
+  ]);
+  indexesInitialized = true;
 }
 
 export function setTestDb(db, client = null) {
@@ -326,9 +322,10 @@ export async function connectToDatabase() {
     connectionPromise = client
       .connect()
       .then(async (connectedClient) => {
+        const db = connectedClient.db(MONGODB_DBNAME);
+        await ensureDatabaseIndexes(db);
         cachedClient = connectedClient;
-        cachedDb = connectedClient.db(MONGODB_DBNAME);
-        await ensureDatabaseIndexes(cachedDb);
+        cachedDb = db;
         return { client: cachedClient, db: cachedDb };
       })
       .catch((err) => {
@@ -941,10 +938,10 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
       return res.status(400).json({ error: 'Validation Error', message: 'Empty image buffer received' });
     }
 
-    if (buffer.length > 5 * 1024 * 1024) {
+    if (buffer.length > 3 * 1024 * 1024) {
       return res.status(400).json({
         error: 'Validation Error',
-        message: 'Image size exceeds maximum limit of 5MB',
+        message: 'Image size exceeds maximum limit of 3MB for serverless deployment compatibility',
       });
     }
 
