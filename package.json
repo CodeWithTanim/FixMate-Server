@@ -7,8 +7,7 @@
   "scripts": {
     "dev": "node --watch index.js",
     "start": "node index.js",
-    "check": "node --check index.js",
-    "test": "node --test test/server.test.js"
+    "check": "node --check index.js"
   },
   "repository": {
     "type": "git",

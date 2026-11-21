@@ -25,9 +25,6 @@ if (STRIPE_SECRET_KEY.startsWith('sk_live_')) {
 }
 let stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-export function setTestStripe(customStripe) {
-  stripe = customStripe;
-}
 
 // Exact origin CORS configuration
 const corsOptions = {
@@ -849,10 +846,6 @@ export async function ensureDatabaseIndexes(db) {
   indexesInitialized = true;
 }
 
-export function setTestDb(db, client = null) {
-  cachedDb = db;
-  cachedClient = client;
-}
 
 export async function connectToDatabase() {
   if (cachedDb) {

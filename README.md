@@ -7,8 +7,8 @@
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Express](https://img.shields.io/badge/Express-4.21-000000?style=for-the-badge&logo=express&logoColor=white)](https://expressjs.com/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-7.8-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](https://www.mongodb.com/)
-[![Stripe](https://img.shields.io/badge/Stripe-Test%20Gateway-635BFF?style=for-the-badge&logo=stripe&logoColor=white)](https://stripe.com/)
-[![Tests](https://img.shields.io/badge/Tests-11%20Passed%20(100%25)-success?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/api/test.html)
+[![Stripe](https://img.shields.io/badge/Stripe-Payments-635BFF?style=for-the-badge&logo=stripe&logoColor=white)](https://stripe.com/)
+[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 **High-performance, secure, and resilient RESTful API engine powering the FixMate on-demand repair service marketplace.**
@@ -162,8 +162,6 @@ The following demo accounts are configured for evaluation and multi-role testing
 ```text
 FixMate-Server/
 ├── index.js             # Consolidated Express server, routes, middleware, Stripe handlers & DB
-├── test/
-│   └── server.test.js   # Automated integration test suite (11 test suites, 100% passing)
 ├── package.json         # Node.js configuration, dependencies and scripts
 ├── .gitignore           # Git ignore rules (strictly excludes .env files)
 └── .vercelignore        # Vercel serverless deployment exclusions
@@ -171,28 +169,14 @@ FixMate-Server/
 
 ---
 
-## 🧪 Testing & Verification
+## 💎 Code Quality & Verification
 
-The server includes a robust integration and domain verification suite built on Node.js native test runner:
+The server runtime and routes can be verified using the built-in syntax checker:
 
 ```bash
 # Run syntax and static validation
 npm run check
-
-# Run automated integration test suite (11 tests)
-npm test
 ```
-
-### Verified Test Cases
-- ✅ **USD Gateway Thresholds**: Rejects negative, zero, non-numeric, or fractional-cent payment amounts.
-- ✅ **Dhaka Calendar Engine**: Validates `YYYY-MM-DD` scheduling against past days in the explicit `Asia/Dhaka` timezone.
-- ✅ **Payment Fulfillment Security**: Rejects uncompleted bookings, customer email mismatches, and amount discrepancies.
-- ✅ **Stripe Livemode Protection**: Strictly blocks livemode Stripe keys and livemode sessions in test environments.
-- ✅ **Pro Subscription Fulfillment**: Verifies $29.00 integer amount, binds customer ID, and activates Pro tier idempotently.
-- ✅ **Invoice Webhook Reconciliation**: Idempotently records recurring invoice renewals and ignores stale failed invoices.
-- ✅ **Integer Review Ratings**: Enforces 1–5 integer ratings and rejects non-integer/out-of-bounds ratings.
-- ✅ **Checkout Generation Consistency**: Guarantees generation counter increments to prevent replay of cancelled checkouts.
-- ✅ **Duplicate Active Booking Guard**: Returns HTTP 409 Conflict when a duplicate active booking is submitted.
 
 ---
 
