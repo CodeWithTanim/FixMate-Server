@@ -45,11 +45,13 @@ app.use(cors(corsOptions));
 
 // Shared Stripe payment fulfillment helper (idempotent for webhook & client return)
 export async function fulfillPaymentSession(session) {
+  if (!session) return null;
+
   const db = await getDb();
   const bookingsCollection = db.collection('bookings');
   const paymentsCollection = db.collection('payments');
 
-  // Verify session completion and currency invariants
+  // 1. Verify session completion and currency invariants
   if (session.payment_status !== 'paid') {
     console.error('Ignoring payment fulfillment for unpaid session:', session.id);
     return null;
@@ -58,22 +60,77 @@ export async function fulfillPaymentSession(session) {
     console.error('Invalid currency in session:', session.currency);
     return null;
   }
+  if (session.mode && session.mode !== 'payment') {
+    console.error('Invalid session mode for repair payment:', session.mode);
+    return null;
+  }
 
+  // 2. Validate booking ID
   const bookingId = session.metadata?.bookingId || session.client_reference_id;
   if (!bookingId || !ObjectId.isValid(bookingId)) {
     console.error('Invalid booking ID in session metadata:', bookingId);
     return null;
   }
 
+  // 3. Retrieve booking and enforce state machine invariant
   const booking = await bookingsCollection.findOne({ _id: new ObjectId(bookingId) });
   if (!booking) {
     console.error('Booking not found for payment fulfillment:', bookingId);
     return null;
   }
 
-  // Idempotent payment ledger record
-  const existingPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
-  if (!existingPayment) {
+  // Critical invariant: Only completed repair jobs can be fulfilled/paid!
+  if (booking.status !== 'completed') {
+    console.error(`Cannot fulfill payment: booking ${bookingId} is in status '${booking.status}', not 'completed'`);
+    return null;
+  }
+
+  // 4. Verify customer ownership
+  if (
+    session.customer_email &&
+    booking.customerEmail &&
+    session.customer_email.toLowerCase() !== booking.customerEmail.toLowerCase()
+  ) {
+    console.error('Customer email mismatch between Stripe session and booking');
+    return null;
+  }
+
+  if (
+    session.metadata?.customerId &&
+    booking.customerId &&
+    session.metadata.customerId !== booking.customerId
+  ) {
+    console.error('Customer ID mismatch between Stripe session and booking');
+    return null;
+  }
+
+  // 5. Verify exact expected cents vs received cents
+  const expectedAmount = booking.finalAmount || booking.basePrice;
+  if (typeof expectedAmount !== 'number' || expectedAmount <= 0) {
+    console.error('Invalid expected amount on booking:', expectedAmount);
+    return null;
+  }
+  const expectedCents = Math.round(expectedAmount * 100);
+  const paidCents = Math.round(session.amount_total || 0);
+  if (paidCents !== expectedCents) {
+    console.error(
+      `Payment amount mismatch for booking ${bookingId}. Expected: ${expectedCents} cents ($${expectedAmount}), received: ${paidCents} cents`
+    );
+    return null;
+  }
+
+  // 6. If booking is already paid or payment record exists, return idempotent success
+  if (booking.paymentStatus === 'paid') {
+    return booking;
+  }
+  const existingBookingPayment = await paymentsCollection.findOne({ bookingId: booking._id.toString() });
+  if (existingBookingPayment) {
+    return booking;
+  }
+
+  // 7. Enforce exactly-once payment ledger insertion (unique on bookingId)
+  const paidAmount = (paidCents / 100).toFixed(2);
+  try {
     await paymentsCollection.insertOne({
       stripeSessionId: session.id,
       stripePaymentIntentId: session.payment_intent || null,
@@ -84,15 +141,18 @@ export async function fulfillPaymentSession(session) {
       customerName: booking.customerName,
       technicianEmail: booking.technicianEmail,
       technicianName: booking.technicianName,
-      amount: (session.amount_total || 0) / 100,
-      currency: session.currency || 'usd',
+      amount: paidCents / 100,
+      currency: 'usd',
       status: 'succeeded',
       createdAt: new Date(),
     });
+  } catch (err) {
+    if (err.code !== 11000 && !err.message?.includes('duplicate key')) {
+      throw err;
+    }
   }
 
-  // Atomic exactly-once update on booking record
-  const paidAmount = ((session.amount_total || 0) / 100).toFixed(2);
+  // 8. Atomic exactly-once update on booking record
   await bookingsCollection.updateOne(
     { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
     {
@@ -170,8 +230,21 @@ export async function ensureDatabaseIndexes(db) {
       db.collection('services').createIndex({ technicianEmail: 1, createdAt: -1 }),
       db.collection('bookings').createIndex({ customerEmail: 1, createdAt: -1 }),
       db.collection('bookings').createIndex({ technicianEmail: 1, status: 1 }),
-      db.collection('bookings').createIndex({ customerEmail: 1, serviceId: 1, status: 1 }),
+      db.collection('bookings').createIndex(
+        { customerEmail: 1, serviceId: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            status: { $in: ['requested', 'accepted', 'in-progress'] },
+          },
+          name: 'unique_active_customer_service_booking',
+        }
+      ),
       db.collection('payments').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
+      db.collection('payments').createIndex(
+        { bookingId: 1 },
+        { unique: true, name: 'unique_booking_payment' }
+      ),
       db.collection('payments').createIndex({ customerEmail: 1, createdAt: -1 }),
       db.collection('user').createIndex({ email: 1 }, { unique: true, sparse: true }),
     ]);
@@ -181,8 +254,13 @@ export async function ensureDatabaseIndexes(db) {
   }
 }
 
+export function setTestDb(db, client = null) {
+  cachedDb = db;
+  cachedClient = client;
+}
+
 export async function connectToDatabase() {
-  if (cachedClient && cachedDb) {
+  if (cachedDb) {
     return { client: cachedClient, db: cachedDb };
   }
 
@@ -782,22 +860,14 @@ app.patch('/api/admin/services/:id/approval', verifyToken, verifyAdmin, async (r
   }
 });
 
-// POST /api/upload - Handle image upload to ImgBB
+// POST /api/upload - Handle real image upload to ImgBB
 app.post('/api/upload', verifyToken, async (req, res, next) => {
   try {
     const { image } = req.body;
     const apiKey = process.env.IMGBB_API_KEY;
 
-    if (!image) {
-      return res.status(400).json({ error: 'Validation Error', message: 'Image data is required' });
-    }
-
-    // Direct HTTP(S) URLs are accepted directly
-    if (typeof image === 'string' && (image.startsWith('http://') || image.startsWith('https://'))) {
-      return res.status(200).json({
-        url: image,
-        display_url: image,
-      });
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ error: 'Validation Error', message: 'Image base64 data is required' });
     }
 
     if (!apiKey) {
@@ -807,8 +877,10 @@ app.post('/api/upload', verifyToken, async (req, res, next) => {
       });
     }
 
-    // Validate base64 image data and payload size limit (max 5MB)
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    // Strictly validate base64 image data and payload size limit (max 5MB)
+    const base64Match = image.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/);
+    const base64Data = base64Match ? base64Match[2] : image.replace(/^data:image\/\w+;base64,/, '');
+
     const estimatedSizeBytes = base64Data.length * 0.75;
     if (estimatedSizeBytes > 5 * 1024 * 1024) {
       return res.status(400).json({
@@ -949,7 +1021,19 @@ app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res, next) =>
       updatedAt: new Date(),
     };
 
-    const insertResult = await bookingsCollection.insertOne(newBooking);
+    let insertResult;
+    try {
+      insertResult = await bookingsCollection.insertOne(newBooking);
+    } catch (insertErr) {
+      if (insertErr.code === 11000 || insertErr.message?.includes('duplicate key')) {
+        return res.status(409).json({
+          error: 'Conflict',
+          message: 'You already have an active booking request for this service. Track its progress in your dashboard.',
+        });
+      }
+      throw insertErr;
+    }
+
     newBooking.id = insertResult.insertedId.toString();
     newBooking._id = insertResult.insertedId.toString();
 
@@ -1531,36 +1615,56 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
       });
     }
 
+    // Reuse existing open Stripe checkout session if one was already issued for this booking
+    if (booking.stripeSessionId) {
+      try {
+        const existingSession = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+        if (existingSession && existingSession.status === 'open' && existingSession.url) {
+          return res.status(200).json({
+            url: existingSession.url,
+            sessionId: existingSession.id,
+          });
+        }
+      } catch (err) {
+        // If expired or retrieval error, proceed to create new session
+      }
+    }
+
     const clientOrigin = req.headers.origin || CORS_ORIGINS[0] || 'http://localhost:3000';
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: `FixMate: ${booking.serviceTitle}`,
-              description: `Completed repair service by ${booking.technicianName}`,
-              images: booking.serviceImage ? [booking.serviceImage] : [],
+    const session = await stripe.checkout.sessions.create(
+      {
+        payment_method_types: ['card'],
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: {
+                name: `FixMate: ${booking.serviceTitle}`,
+                description: `Completed repair service by ${booking.technicianName}`,
+                images: booking.serviceImage ? [booking.serviceImage] : [],
+              },
+              unit_amount: amountInCents,
             },
-            unit_amount: amountInCents,
+            quantity: 1,
           },
-          quantity: 1,
+        ],
+        mode: 'payment',
+        customer_email: req.user.email,
+        client_reference_id: booking._id.toString(),
+        metadata: {
+          bookingId: booking._id.toString(),
+          customerId: req.user.id,
+          technicianEmail: booking.technicianEmail,
+          serviceTitle: booking.serviceTitle,
         },
-      ],
-      mode: 'payment',
-      customer_email: req.user.email,
-      client_reference_id: booking._id.toString(),
-      metadata: {
-        bookingId: booking._id.toString(),
-        customerId: req.user.id,
-        technicianEmail: booking.technicianEmail,
-        serviceTitle: booking.serviceTitle,
+        success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
+        cancel_url: `${clientOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
       },
-      success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id.toString()}`,
-      cancel_url: `${clientOrigin}/payment/cancel?booking_id=${booking._id.toString()}`,
-    });
+      {
+        idempotencyKey: `checkout_${booking._id.toString()}_${amountInCents}`,
+      }
+    );
 
     await bookingsCollection.updateOne(
       { _id: new ObjectId(bookingId) },
