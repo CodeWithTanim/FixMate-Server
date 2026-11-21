@@ -28,6 +28,7 @@ FixMate-Server/
 - `npm run dev`: Start local development server with file watching (`node --watch index.js`)
 - `npm run start`: Start the production server (`node index.js`)
 - `npm run check`: Verify syntax on `index.js` (`node --check index.js`)
+- `npm test`: Run automated backend integration and domain tests (`node --test test/server.test.js`)
 
 ## API Endpoint Reference
 

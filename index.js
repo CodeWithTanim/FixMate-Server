@@ -11,7 +11,7 @@ const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DBNAME = process.env.MONGODB_DBNAME || 'fixmate-db';
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
-  : ['http://localhost:3000'];
+  : (process.env.NODE_ENV === 'production' ? [] : ['http://localhost:3000', 'http://127.0.0.1:3000']);
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const JWT_ISSUER = process.env.JWT_ISSUER || 'http://localhost:3000';
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || 'fixmate-api';
@@ -2261,7 +2261,8 @@ app.use((err, req, res, next) => {
   });
 });
 
-if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
+const isTestRunner = process.env.NODE_ENV === 'test' || process.argv.some((arg) => arg.includes('test'));
+if (!process.env.VERCEL && !isTestRunner) {
   const server = app.listen(PORT, () => {
     console.log(`FixMate server running on port ${PORT}`);
   });
