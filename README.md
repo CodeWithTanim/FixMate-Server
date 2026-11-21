@@ -1,5 +1,7 @@
 # FixMate Server
 
+**Deployment Target**: [https://fixmate-nine.vercel.app](https://fixmate-nine.vercel.app) *(Deployment pending evaluation authorization / push hold)*
+
 FixMate backend API built with Node.js, Express, and MongoDB in a clean, high-performance architecture centered entirely in `index.js`. It powers the FixMate repair service marketplace with role-based access control, service management, repair booking state machine, and Stripe test-mode checkout workflows.
 
 ## Technology Stack
@@ -109,3 +111,16 @@ Configure these variables in your deployment environment. Never commit `.env` fi
 | `STRIPE_SECRET_KEY` | Stripe test secret API key (`sk_test_...`) |
 | `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret (`whsec_...`) |
 | `IMGBB_API_KEY` | Optional ImgBB API key for image hosting |
+
+## Demo Accounts
+
+The following demo accounts are configured for evaluation and multi-role testing:
+
+| Role | Email | Service Area / Note |
+| :--- | :--- | :--- |
+| **Admin** | `admin@fixmate.dev` | Full platform administration, service approval, role management |
+| **Technician 1** | `rahim.tech@fixmate.dev` | Smartphone & Laptop specialist (Dhaka Central) |
+| **Technician 2** | `sarah.appliances@fixmate.dev` | Refrigerator & AC specialist (Banani & Gulshan) |
+| **Customer** | `customer@fixmate.dev` | Customer account with booking and payment history |
+
+*Note: For evaluator access, demo accounts can be initialized idempotently using `npm run seed` with `DEMO_USER_PASSWORD` configured in your private `.env` file, or obtained securely from the private evaluation handoff.*
