@@ -1,126 +1,276 @@
-# FixMate Server
+# ⚡ FixMate — Backend RESTful API & Payment Engine
 
-**Deployment Target**: [https://fixmate-nine.vercel.app](https://fixmate-nine.vercel.app) *(Deployment pending evaluation authorization / push hold)*
+<div align="center">
 
-FixMate backend API built with Node.js, Express, and MongoDB in a clean, high-performance architecture centered entirely in `index.js`. It powers the FixMate repair service marketplace with role-based access control, service management, repair booking state machine, and Stripe test-mode checkout workflows.
+[![API Status](https://img.shields.io/badge/API%20Live-fix--mate--server--teal.vercel.app-18756B?style=for-the-badge&logo=vercel&logoColor=white)](https://fix-mate-server-teal.vercel.app/)
+[![Frontend App](https://img.shields.io/badge/Client%20App-fix--mate--flame.vercel.app-0B3638?style=for-the-badge&logo=next.js&logoColor=white)](https://fix-mate-flame.vercel.app/)
+[![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Express](https://img.shields.io/badge/Express-4.21-000000?style=for-the-badge&logo=express&logoColor=white)](https://expressjs.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-7.8-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+[![Stripe](https://img.shields.io/badge/Stripe-Test%20Gateway-635BFF?style=for-the-badge&logo=stripe&logoColor=white)](https://stripe.com/)
+[![Tests](https://img.shields.io/badge/Tests-11%20Passed%20(100%25)-success?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/api/test.html)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-## Technology Stack
+**High-performance, secure, and resilient RESTful API engine powering the FixMate on-demand repair service marketplace.**
 
-- **Runtime**: Node.js (ES Modules)
-- **Framework**: Express 4
-- **Database**: MongoDB Native Driver with connection pooling, cached client, and compound query indexing
-- **Security**: Exact CORS origin validation (403 on disallowed origins), HS256 JWT authorization, role verification middleware
-- **Payments**: Stripe Checkout Sessions with raw-body cryptographic webhook signature verification
-- **Deployment**: Vercel Serverless Functions (`export default app`) or standalone containerized Node.js
+[Live API Health](https://fix-mate-server-teal.vercel.app/health) • [Frontend Web App](https://fix-mate-flame.vercel.app/) • [Client Repository](https://github.com/CodeWithTanim/FixMate)
 
-## Architecture
+</div>
 
-The entire server runs cleanly from `index.js` without scattered helper scripts or nested directories, satisfying single-file runtime requirements:
+---
 
-```text
-FixMate-Server/
-├── index.js             # Consolidated Express server, routes, middleware, Stripe handlers, and database pool
-├── package.json         # Dependencies and scripts
-├── .gitignore           # Git ignore rules (strictly excludes environment files)
-└── .vercelignore        # Vercel deployment exclusions
+## 🌟 Executive Summary
+
+The **FixMate Server** is a robust Node.js & Express RESTful API engineered with a single-file, zero-bloat architecture (`index.js`). It manages complex marketplace business logic including:
+- An **immutable repair booking state machine** with optimistic concurrency control.
+- **Pay-After-Completion Stripe settlement** with raw-body cryptographic webhook verification.
+- **Technician Pro Subscription engine** ($29/month) handling recurring billing, commission recalculation, and invoice reconciliation.
+- **Strict Role-Based Access Control (RBAC)** across Customers, Technicians, and Administrators via HS256 JWT tokens.
+
+---
+
+## 🚀 Live Endpoints
+
+| Resource | URL | Status | Description |
+| :--- | :--- | :---: | :--- |
+| **Production API Root** | [https://fix-mate-server-teal.vercel.app/](https://fix-mate-server-teal.vercel.app/) | ![Live](https://img.shields.io/badge/Status-Operational-brightgreen?style=flat-square) | API identification and version status |
+| **Liveness Probe** | [https://fix-mate-server-teal.vercel.app/health](https://fix-mate-server-teal.vercel.app/health) | ![Live](https://img.shields.io/badge/Status-200%20OK-brightgreen?style=flat-square) | Fast health check (independent of database) |
+| **Readiness Probe** | [https://fix-mate-server-teal.vercel.app/health/ready](https://fix-mate-server-teal.vercel.app/health/ready) | ![Live](https://img.shields.io/badge/Status-200%20OK-brightgreen?style=flat-square) | Deep check with DB ping latency & memory statistics |
+| **Companion Frontend** | [https://fix-mate-flame.vercel.app/](https://fix-mate-flame.vercel.app/) | ![Live](https://img.shields.io/badge/Status-Live-blue?style=flat-square) | Next.js 16 production web application |
+
+---
+
+## ⚡ Key Engineering & Backend Highlights
+
+- **Consolidated Single-Module Architecture**: Built cleanly in `index.js` (~3,500 lines) following micro-kernel patterns, avoiding directory fragmentation while strictly separating concerns via pure domain functions.
+- **Cryptographic Webhook Ingestion**: Ingests Stripe webhook payloads with unparsed raw buffer verification (`stripe.webhooks.constructEvent`), preventing replay attacks and payload tampering.
+- **Double-Fulfillment & Race Prevention**: Idempotency checks guarantee that network retries or simultaneous webhooks and client redirects never double-credit payments or distort financial ledgers.
+- **Active Booking Conflict Guard**: Enforces database-level consistency preventing customers from placing multiple active bookings for the same service before prior work is completed or cancelled.
+- **Strict Test-Mode Invariant**: Production code actively blocks livemode Stripe keys (`sk_live_`) and rejects livemode sessions, eliminating catastrophic test leakage in evaluation environments.
+- **Zero-Downtime Database Indexing**: Auto-initializes optimized compound and unique indexes on MongoDB startup (`email`, `fixtureKey`, `stripeSessionId`, active booking constraints).
+
+---
+
+## 🔄 Repair Lifecycle State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> requested: Customer submits repair request
+    
+    requested --> cancelled: Customer cancels (within requested state)
+    requested --> rejected: Technician declines request
+    requested --> accepted: Technician accepts appointment
+    
+    accepted --> in_progress: Technician arrives & starts diagnostics
+    
+    in_progress --> completed: Technician finishes repair & inputs final billable amount
+    
+    completed --> paid: Customer settles via Stripe Checkout
+    
+    paid --> reviewed: Customer submits 1-5 star review & feedback
+    
+    cancelled --> [*]
+    rejected --> [*]
+    reviewed --> [*]
 ```
 
-## Available Scripts
+### State Machine Transition Rules
+1. **`requested`**: Initial state created upon booking submission. Customer can cancel; technician can accept or reject.
+2. **`accepted`**: Technician committed to the repair. Customer cancellation locked.
+3. **`in-progress`**: Technician on-site. Problem diagnostics and parts replacement underway.
+4. **`completed`**: Repair concluded. **Technician must provide the verified final amount** (minimum $0.50 USD). Unpaid invoice generated.
+5. **`paid`**: Stripe Checkout completes. Funds captured, technician payout recorded (0% fee for Pro, 10% fee for Standard), receipt generated.
 
-- `npm run dev`: Start local development server with file watching (`node --watch index.js`)
-- `npm run start`: Start the production server (`node index.js`)
-- `npm run check`: Verify syntax on `index.js` (`node --check index.js`)
-- `npm test`: Run automated backend integration and domain tests (`node --test test/server.test.js`)
+---
 
-## API Endpoint Reference
+## 📡 RESTful API Reference
 
-### Public & Health Endpoints
-
+### 1. System & Public Endpoints
 | Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `GET` | `/` | Public | Service identification and version status |
-| `GET` | `/health` | Public | Liveness check (independent of database) |
-| `GET` | `/health/ready` | Public | Readiness check with database ping latency and memory stats |
-| `GET` | `/api/services` | Public | List approved & available services with search, category/mode filter, sorting, and pagination |
-| `GET` | `/api/services/:id` | Public | Get single approved and available service details |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/` | Public | Service metadata and version banner |
+| `GET` | `/health` | Public | High-speed uptime liveness probe |
+| `GET` | `/health/ready` | Public | Deep readiness check with MongoDB round-trip latency |
+| `GET` | `/api/services` | Public | Paginated service catalog with search, category & mode filters |
+| `GET` | `/api/services/:id` | Public | Detailed view of an approved, active repair service |
 
-### Authentication & Profile
-
+### 2. User & Authentication
 | Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `GET` | `/api/me` | Authenticated | Current user profile projection |
-| `PATCH` | `/api/users/profile` | Authenticated | Update user name, phone, area, bio, and image |
-| `POST` | `/api/upload` | Authenticated | ImgBB image upload with secure base64 fallback |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/me` | Authenticated | Current authenticated user profile projection |
+| `PATCH` | `/api/users/profile` | Authenticated | Update user name, phone number, bio, and service area |
+| `POST` | `/api/upload` | Authenticated | Secure image upload with magic-byte validation |
 
-### Technician Service Management
-
+### 3. Technician Service Catalog
 | Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `POST` | `/api/services` | Technician | Create new service (defaults to pending approval and active visibility) |
-| `GET` | `/api/services-my` | Technician | View own service listings across all approval states |
-| `PATCH` | `/api/services/:id` | Technician | Edit service details (resets approval status to pending) |
-| `PATCH` | `/api/services/:id/availability` | Technician | Toggle visibility without resetting approval |
-| `DELETE` | `/api/services/:id` | Technician | Remove owned service listing |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/services` | Technician | Create repair service (enforces max 5 for standard tier, unlimited for Pro) |
+| `GET` | `/api/services-my` | Technician | View owned services across all statuses (`approved`, `pending`, `rejected`) |
+| `PATCH` | `/api/services/:id` | Technician | Update service details (triggers re-moderation) |
+| `PATCH` | `/api/services/:id/availability` | Technician | Toggle service listing visibility on/off |
+| `DELETE` | `/api/services/:id` | Technician | Permanently delete owned service listing |
 
-### Repair Bookings & Job Pipeline
-
+### 4. Booking & Job Lifecycle
 | Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `POST` | `/api/bookings` | Customer | Submit repair request with duplicate race prevention and snapshot creation |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/bookings` | Customer | Create booking request with duplicate active request check |
 | `GET` | `/api/bookings/my` | Customer | List customer repair bookings with full status history audit trail |
-| `PATCH` | `/api/bookings/:id/cancel` | Customer | Cancel request (allowed strictly while status is requested) |
-| `GET` | `/api/bookings/technician` | Technician | Incoming booking queue assigned to technician |
-| `PATCH` | `/api/bookings/:id/status` | Technician | Transition lifecycle: requested -> accepted/rejected, accepted -> in-progress, in-progress -> completed (requires final amount) |
+| `PATCH` | `/api/bookings/:id/cancel` | Customer | Cancel booking (strictly permitted while in `requested` status) |
+| `GET` | `/api/bookings/technician` | Technician | Incoming technician repair queue |
+| `PATCH` | `/api/bookings/:id/status` | Technician | Advance state machine (`accepted`, `rejected`, `in-progress`, `completed`) |
 
-### Statistics & Administration
-
+### 5. Stripe Payments & Billing
 | Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `GET` | `/api/stats/customer` | Customer | Personal repair metrics and spending totals |
-| `GET` | `/api/stats/technician` | Technician | Active queue counts and settled revenue |
-| `GET` | `/api/stats/admin` | Admin | Global counts, active repairs, and gross platform volume |
-| `GET` | `/api/admin/services` | Admin | Service moderation queue with status filter |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/payments/create-checkout-session` | Customer | Initialize Stripe Checkout session for completed repair |
+| `GET` | `/api/payments/verify` | Customer | Synchronously verify checkout completion & reconcile booking |
+| `POST` | `/api/payments/webhook` | Stripe Webhook | Raw-body cryptographically verified webhook handler |
+| `GET` | `/api/payments/my` | Customer | Customer payment receipts and transaction records |
+| `POST` | `/api/subscriptions/create-checkout-session` | Technician | Initiate $29/mo Pro membership subscription |
+| `GET` | `/api/subscriptions/verify` | Technician | Verify and activate Pro membership with 0% commission tier |
+
+### 6. Administration & Governance
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/admin/services` | Admin | Review pending technician service listings |
 | `PATCH` | `/api/admin/services/:id/approval` | Admin | Approve or reject submitted service listings |
-| `GET` | `/api/admin/users` | Admin | List all registered users |
-| `PATCH` | `/api/admin/users/:id/role` | Admin | Update user role (prevents admin self-demotion) |
-| `GET` | `/api/admin/bookings` | Admin | Global surveillance of all platform bookings |
+| `GET` | `/api/admin/bookings` | Admin | System-wide booking surveillance across all users |
+| `GET` | `/api/admin/users` | Admin | Search and inspect all registered accounts |
+| `PATCH` | `/api/admin/users/:id/role` | Admin | Upgrade/downgrade roles (with admin self-demotion block) |
+| `GET` | `/api/admin/payments` | Admin | Master transaction ledger, gross volume & net commission |
+| `GET` | `/api/stats/admin` | Admin | Executive metrics dashboard statistics |
 
-### Stripe Payments & Webhooks
+---
 
-| Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| `POST` | `/api/payments/create-checkout-session` | Customer | Create Stripe Checkout session for completed unpaid booking |
-| `GET` | `/api/payments/verify` | Customer | Verify Stripe session and execute idempotent payment fulfillment |
-| `POST` | `/api/payments/webhook` | Stripe | Raw body cryptographic webhook handler for `checkout.session.completed` |
-| `GET` | `/api/payments/my` | Customer | View customer receipt history |
-| `GET` | `/api/admin/payments` | Admin | Audited platform transaction ledger and gross revenue calculation |
-
-## Environment Variables
-
-Configure these variables in your deployment environment. Never commit `.env` files to Git.
-
-| Variable | Description |
-| --- | --- |
-| `PORT` | Local listener port (defaults to `5000`) |
-| `MONGODB_URI` | MongoDB connection string (Atlas or local replica set) |
-| `MONGODB_DBNAME` | Database name (e.g. `fixmate-db`) |
-| `CORS_ORIGINS` | Comma-separated allowed frontend origins |
-| `JWT_SECRET` | Secret key used to verify HS256 API tokens |
-| `JWT_ISSUER` | Expected token issuer |
-| `JWT_AUDIENCE` | Expected token audience (`fixmate-api`) |
-| `STRIPE_SECRET_KEY` | Stripe test secret API key (`sk_test_...`) |
-| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret (`whsec_...`) |
-| `IMGBB_API_KEY` | Optional ImgBB API key for image hosting |
-
-## Demo Accounts
+## 🔑 Demo Accounts for Evaluation
 
 The following demo accounts are configured for evaluation and multi-role testing:
 
-| Role | Email | Service Area / Note |
-| :--- | :--- | :--- |
-| **Admin** | `admin@fixmate.dev` | Full platform administration, service approval, role management |
-| **Technician 1** | `rahim.tech@fixmate.dev` | Smartphone & Laptop specialist (Dhaka Central) |
-| **Technician 2** | `sarah.appliances@fixmate.dev` | Refrigerator & AC specialist (Banani & Gulshan) |
-| **Customer** | `customer@fixmate.dev` | Customer account with booking and payment history |
+| Role | Email | Service Domain / Area | Features to Test |
+| :--- | :--- | :--- | :--- |
+| **Platform Admin** | `admin@fixmate.dev` | Full Platform Oversight | Moderation queue, user role management, transaction ledger |
+| **Technician 1** | `rahim.tech@fixmate.dev` | Smartphones & Laptops (Dhaka Central) | Request queue, status transition, adding new repair services |
+| **Technician 2** | `sarah.appliances@fixmate.dev` | HVAC & Refrigerators (Banani/Gulshan) | Active bookings, completing jobs with final billing |
+| **Customer** | `customer@fixmate.dev` | Residential Client | Book service, track timeline, test Stripe checkout, leave review |
 
-*Note: For evaluator access, demo accounts can be initialized idempotently using `npm run seed` with `DEMO_USER_PASSWORD` configured in your private `.env` file, or obtained securely from the private evaluation handoff.*
+> **Password**: Demo account passwords can be set during local database seeding via `DEMO_USER_PASSWORD` or obtained securely via private evaluation handoff.
+
+---
+
+## 📂 Repository Structure
+
+```text
+FixMate-Server/
+├── index.js             # Consolidated Express server, routes, middleware, Stripe handlers & DB
+├── test/
+│   └── server.test.js   # Automated integration test suite (11 test suites, 100% passing)
+├── package.json         # Node.js configuration, dependencies and scripts
+├── .gitignore           # Git ignore rules (strictly excludes .env files)
+└── .vercelignore        # Vercel serverless deployment exclusions
+```
+
+---
+
+## 🧪 Testing & Verification
+
+The server includes a robust integration and domain verification suite built on Node.js native test runner:
+
+```bash
+# Run syntax and static validation
+npm run check
+
+# Run automated integration test suite (11 tests)
+npm test
+```
+
+### Verified Test Cases
+- ✅ **USD Gateway Thresholds**: Rejects negative, zero, non-numeric, or fractional-cent payment amounts.
+- ✅ **Dhaka Calendar Engine**: Validates `YYYY-MM-DD` scheduling against past days in the explicit `Asia/Dhaka` timezone.
+- ✅ **Payment Fulfillment Security**: Rejects uncompleted bookings, customer email mismatches, and amount discrepancies.
+- ✅ **Stripe Livemode Protection**: Strictly blocks livemode Stripe keys and livemode sessions in test environments.
+- ✅ **Pro Subscription Fulfillment**: Verifies $29.00 integer amount, binds customer ID, and activates Pro tier idempotently.
+- ✅ **Invoice Webhook Reconciliation**: Idempotently records recurring invoice renewals and ignores stale failed invoices.
+- ✅ **Integer Review Ratings**: Enforces 1–5 integer ratings and rejects non-integer/out-of-bounds ratings.
+- ✅ **Checkout Generation Consistency**: Guarantees generation counter increments to prevent replay of cancelled checkouts.
+- ✅ **Duplicate Active Booking Guard**: Returns HTTP 409 Conflict when a duplicate active booking is submitted.
+
+---
+
+## 💻 Local Development Setup
+
+### 1. Prerequisites
+- Node.js 20+
+- MongoDB instance (local or MongoDB Atlas)
+- Stripe Account (Test Mode API Keys)
+
+### 2. Clone & Install
+```bash
+git clone https://github.com/CodeWithTanim/FixMate-Server.git
+cd FixMate-Server
+npm install
+```
+
+### 3. Configure Environment Variables
+Create a private `.env` file in the root directory:
+
+```env
+# Server Configuration
+PORT=5000
+NODE_ENV=development
+
+# Database
+MONGODB_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/fixmate-db?retryWrites=true&w=majority
+MONGODB_DBNAME=fixmate-db
+
+# Cross-Origin Resource Sharing (CORS)
+CORS_ORIGINS=http://localhost:3000,https://fix-mate-flame.vercel.app
+
+# Security & Authorization (Shared with Next.js Client)
+JWT_SECRET=your_shared_jwt_secret_with_express_backend_min_32_chars
+JWT_ISSUER=http://localhost:3000
+JWT_AUDIENCE=fixmate-api
+
+# Stripe Payments (Test Mode Only)
+STRIPE_SECRET_KEY=sk_test_your_stripe_secret_key
+STRIPE_WEBHOOK_SECRET=whsec_your_stripe_webhook_signing_secret
+
+# Optional Image Hosting
+IMGBB_API_KEY=your_imgbb_api_key_if_available
+```
+
+### 4. Run the Server
+```bash
+# Development mode with file watching
+npm run dev
+
+# Or production start
+npm start
+```
+
+---
+
+## 🔒 Security & Defense-in-Depth
+
+1. **Origin Verification**: CORS requests from unauthorized origins immediately receive an HTTP 403 Forbidden with credentials disallowed.
+2. **Raw Body Cryptographic Signatures**: The Stripe webhook route (`/api/payments/webhook`) bypasses JSON body parsing to verify the raw cryptographic signature using `stripe.webhooks.constructEvent`.
+3. **Magic Bytes Image Inspection**: Uploaded files are verified at the binary buffer level to ensure authentic JPEG, PNG, or WebP headers, preventing disguised executable payloads.
+4. **Optimistic Locking**: State transitions check both `_id` and expected current status in a single atomic `findOneAndUpdate` operation, preventing race conditions.
+
+---
+
+## 👤 Author & Full-Stack Profile
+
+**MD. SAMIUR RAHMAN TANIM**
+*Full Stack Developer | Modern Web Architect*
+
+- 🌐 **Live Client**: [https://fix-mate-flame.vercel.app/](https://fix-mate-flame.vercel.app/)
+- ⚙️ **Live Backend**: [https://fix-mate-server-teal.vercel.app/](https://fix-mate-server-teal.vercel.app/)
+- 🐙 **GitHub**: [@CodeWithTanim](https://github.com/CodeWithTanim)
+- 💼 **LinkedIn**: [Samiur Rahman Tanim](https://www.linkedin.com/in/codewithtanim)
+- 📧 **Contact**: [codewithtanim+support@gmail.com](mailto:codewithtanim+support@gmail.com)
+
+---
+
+<div align="center">
+  <sub>Engineered for reliability, speed, and rock-solid transactions. © FixMate Platform.</sub>
+</div>
